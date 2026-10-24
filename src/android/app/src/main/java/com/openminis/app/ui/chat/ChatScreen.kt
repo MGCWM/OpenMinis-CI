@@ -3692,6 +3692,9 @@ fun ChatScreen(
                 // prewarm when (if) it has finished by then, else -1.
                 var lastColdPrewarmMs by remember(sessionId) { mutableStateOf(-1L) }
                 var coldOpenSummaryEmitted by remember(sessionId) { mutableStateOf(false) }
+                // [T-android-gc-storm-fix19] Size signature of the newest row's
+                // last REPORTED placement — see the onPlaced dedupe below.
+                var lastNewestSizeSig by remember(sessionId) { mutableStateOf(Int.MIN_VALUE) }
                 val screenMountAtMs = remember(sessionId) { System.currentTimeMillis() }
                 // T-streaming-side-channel: messages-level changes (new
                 // message, retry, etc.) AND streamingById deltas both feed
@@ -3731,6 +3734,12 @@ fun ChatScreen(
                     var frozenRows: List<FlatChatItem> = emptyList()
                     var frozenKeys: Set<String> = emptySet()
                     var frozenSplitIdx = -1
+                    // [T-android-gc-storm-fix19] Cached key→index map of the
+                    // frozen prefix (indices 0..frozenRows.size-1). Rebuilt only
+                    // when the frozen prefix itself is rebuilt; reused by
+                    // reference on every tick in between. Plain var (not state):
+                    // it feeds flatRowIndexByKey which is the published state.
+                    var frozenIndexMap: Map<String, Int>? = null
                     var streamWasActive = false
                     // [T-android-stream-pipeline-incremental] Flush the perf
                     // turn when this effect is CANCELLED mid-turn: the
@@ -3777,6 +3786,9 @@ fun ChatScreen(
                                         "msgCount=${msgs.size}",
                                     )
                                 }
+                                // [T-android-gc-storm-fix19] A genuine frozen
+                                // rebuild invalidates the cached prefix map.
+                                frozenIndexMap = null
                                 val rows = withContext(Dispatchers.Default) {
                                     // [T-android-flatitems-sublist-cme] Pass a
                                     // SNAPSHOT COPY, not msgs.subList(...). A
@@ -3881,8 +3893,29 @@ fun ChatScreen(
                             // the leading-item offset from, and a viewport
                             // deep inside one long assistant turn may contain
                             // no user bubble at all.
-                            flatRowIndexByKey.value = buildMap {
-                                flatItems.forEachIndexed { idx, row -> put(row.key, idx) }
+                            // [T-android-gc-storm-fix19] Incremental key→index
+                            // map. The old code rebuilt a 2000+-entry map on
+                            // EVERY streaming tick (measured: 2024 rows ×
+                            // ~12fps = ~25k map entries + String hashCodes per
+                            // second of pure churn). The frozen prefix's indices
+                            // are stable whenever frozenReused holds — only the
+                            // live suffix (and the frozen prefix on a genuine
+                            // rebuild) needs re-indexing.
+                            run {
+                                val baseMap: Map<String, Int> =
+                                    if (frozenReused && frozenIndexMap != null) frozenIndexMap!!
+                                    else buildMap {
+                                        frozenRows.forEachIndexed { idx, row -> put(row.key, idx) }
+                                    }
+                                frozenIndexMap = baseMap
+                                val liveBase = frozenRows.size
+                                val liveMap = if (liveRows.isEmpty()) baseMap else buildMap {
+                                    putAll(baseMap)
+                                    liveRows.forEachIndexed { idx, row ->
+                                        put(row.key, liveBase + idx)
+                                    }
+                                }
+                                flatRowIndexByKey.value = liveMap
                             }
                             com.openminis.app.diagnostics.StreamJitterProbe.flatten(
                                 ms = (System.nanoTime() - tickStartNs) / 1_000_000,
@@ -4353,18 +4386,39 @@ fun ChatScreen(
                                 }
                             }
                         }
-                        val isNewestItem = item == flatItems.lastOrNull()
+                        // [T-android-gc-storm-fix19] Key comparison, not equals:
+                        // `item == flatItems.lastOrNull()` ran ChatMessage's
+                        // full-field equals for EVERY row on EVERY pass — on a
+                        // 2000-row session that is 2000 data-class equals (each
+                        // comparing potentially long content strings) per
+                        // recomposition burst. Keys are short stable strings;
+                        // this is O(len(key)) with no content touch.
+                        val newestKey = flatItems.lastOrNull()?.key
+                        val isNewestItem = newestKey != null && item.key == newestKey
                         Box(
                             modifier = Modifier
                                 .alpha(rowAlpha)
                                 .then(
                                     if (isNewestItem) {
+                                        // [T-android-gc-storm-fix19] Deduplicate
+                                        // the placed probe by size: a flatItems
+                                        // republication re-lays-out the newest row
+                                        // with an UNCHANGED size (measured: 63
+                                        // consecutive size=1152x0 placements in
+                                        // one cold-open burst), and each of those
+                                        // built a log string + read the memory
+                                        // snapshot from the main thread. Report
+                                        // only when the size actually changed.
                                         Modifier.onPlaced {
-                                            com.openminis.app.diagnostics.PerfLongCtx.step(
-                                                sessionId,
-                                                "lazyColumn.firstItem.placed",
-                                                "size=${it.size.width}x${it.size.height}",
-                                            )
+                                            val sizeSig = it.size.width.toInt() * 1000003 + it.size.height.toInt()
+                                            if (sizeSig != lastNewestSizeSig) {
+                                                lastNewestSizeSig = sizeSig
+                                                com.openminis.app.diagnostics.PerfLongCtx.step(
+                                                    sessionId,
+                                                    "lazyColumn.firstItem.placed",
+                                                    "size=${it.size.width}x${it.size.height}",
+                                                )
+                                            }
                                             // [T-android-jank-diag-logging]
                                             // One quotable line per session
                                             // open, after the first frame's

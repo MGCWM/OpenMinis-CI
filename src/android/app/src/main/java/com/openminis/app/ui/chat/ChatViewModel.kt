@@ -1432,14 +1432,45 @@ class ChatViewModel(
     /** The measurement with its parts, for the [CtxMeter] logs. */
     private data class ContextMeasurement(val history: Int, val fixed: Int, val ratio: Double, val source: String, val measured: Int)
 
+    // [T-android-gc-storm-fix19] Cache fields for [contextMeasurement]'s
+    // signature shortcut — see the KDoc there. Invalidated implicitly: a new
+    // last message / changed history size / changed fixed tokens produces a
+    // different signature string.
+    private var cachedContextSig: String = ""
+    private var cachedContextMeasurement: ContextMeasurement? = null
+
     private fun contextMeasurement(override: Double? = null): ContextMeasurement {
+        // [T-android-gc-storm-fix19] Signature cache. The pre-send check runs
+        // on the MAIN thread inside sendMessage, and every invocation
+        // re-estimated the full history (513K-token session = a 2MB-char walk
+        // plus a shape-string build per message). The history between two
+        // consecutive measurements of the SAME session state (same size, same
+        // last message id, same last content length, same fixed tokens) is
+        // byte-identical, so the estimate is too. Cache hit → zero traversal.
+        val hist = agentHistory
+        val sig = if (override != null) "" else buildString {
+            append(hist.size).append('|')
+            append(hist.lastOrNull()?.dbMessageId ?: "-")
+            append('|')
+            append(hist.lastOrNull()?.content?.length ?: 0)
+            append('|')
+            append(contextFixedTokens)
+        }
+        if (override == null && sig == cachedContextSig) {
+            cachedContextMeasurement?.let { return it }
+        }
         val history = ContextSizeMeter.estimateTokens(effectiveAgentHistoryUncounted())
         val model = currentModel?.id
         val ratio = override ?: contextCalibrationRatio(model)
         val source = if (override != null) "forced"
             else ContextSizeMeter.ratioSource(model, contextCalibrationRatios, lastLearnedCalibration)
-        return ContextMeasurement(history, contextFixedTokens, ratio, source,
+        val result = ContextMeasurement(history, contextFixedTokens, ratio, source,
             ContextSizeMeter.calibrated(history + contextFixedTokens, ratio))
+        if (override == null) {
+            cachedContextSig = sig
+            cachedContextMeasurement = result
+        }
+        return result
     }
 
     /** [CtxMeter] decide — every capacity decision with its inputs, so a field log can replay it. */
