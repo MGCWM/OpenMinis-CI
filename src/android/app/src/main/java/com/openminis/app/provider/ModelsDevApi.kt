@@ -557,7 +557,6 @@ object ModelsDevApi {
     // MARK: - Apply models.dev data
 
     /**
-    /**
      * [T-android-hub-capabilities-vision] Merge a models.dev modalities list
      * with what the gateway itself declared. Precedence for conflicts is the
      * union: `["text"]` (catalog) ∪ `["text","image"]` (gateway) →
