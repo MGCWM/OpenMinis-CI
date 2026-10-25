@@ -1439,6 +1439,15 @@ class ChatViewModel(
     private var cachedContextSig: String = ""
     private var cachedContextMeasurement: ContextMeasurement? = null
 
+    // [T-android-gc-storm-fix20] Bumped by every operation that changes what
+    // effectiveAgentHistoryUncounted() returns WITHOUT touching the four
+    // signature dimensions above: compact success, failed-compact rollback,
+    // revertCompact, offload replacing a part with a stub, and the fast-open
+    // backfill swapping the tail-window history for the full one (identical
+    // size + identical last entry = stale cache hit otherwise). Appended to
+    // the signature so the next measurement is a guaranteed miss.
+    private var ctxCacheEpoch: Long = 0L
+
     private fun contextMeasurement(override: Double? = null): ContextMeasurement {
         // [T-android-gc-storm-fix19] Signature cache. The pre-send check runs
         // on the MAIN thread inside sendMessage, and every invocation
@@ -1454,7 +1463,10 @@ class ChatViewModel(
             append('|')
             append(hist.lastOrNull()?.content?.length ?: 0)
             append('|')
-            append(contextFixedTokens)
+            append(contextFixedTokens).append('|')
+            // [T-android-gc-storm-fix20] Compact/revert/offload/backfill change
+            // the effective view without changing any dimension above.
+            append(ctxCacheEpoch)
         }
         if (override == null && sig == cachedContextSig) {
             cachedContextMeasurement?.let { return it }
@@ -4062,12 +4074,17 @@ class ChatViewModel(
                 )
                 // [T-ctx-measure-outbound] The glow still shows the last report —
                 // the size of the context just replaced.
-                if (compactSucceeded) runCatching {
+                if (compactSucceeded) {
+                    // [T-android-gc-storm-fix20] The effective view just shrank;
+                    // the signature dimensions cannot see it.
+                    ctxCacheEpoch++
+                    runCatching {
                     publishMeasuredContextUsage()
                     // [T-ctx-usage-after-compact] …and replace the placeholder
                     // line, which still carried the pre-compaction figure.
                     announceContextUsageAfterCompaction()
                     AppLogger.info(TAG, "[CtxMeter] compacted marker=${_cachedLatestMarker?.id?.take(8)} measured $compactMeasuredBefore→${measureOutboundContextTokens()}")
+                    }
                 }
                 // [T-android-auto-compact-inloop] Signal the awaiting in-loop
                 // caller. In `finally` so a thrown/cancelled compaction can
@@ -4119,6 +4136,9 @@ class ChatViewModel(
             .getOrNull() ?: 0
         _cachedLatestMarker = previousMarker
         _compactSummary.value = previousMarker?.summary
+        // [T-android-gc-storm-fix20] The effective view changed (summary in /
+        // full history out, or vice versa); the signature cannot see it.
+        ctxCacheEpoch++
         AppLogger.info(
             TAG,
             "[Compact] rolled back failed marker ${markerId.take(8)} (rows=$removed) — " +
@@ -4171,6 +4191,9 @@ class ChatViewModel(
             val next = chatRepository.dao.latestCompactMarker(sid)
             _cachedLatestMarker = next
             _compactSummary.value = next?.summary
+            // [T-android-gc-storm-fix20] Reverting re-widens the effective
+            // view; the signature dimensions (size/last/fixed) are unchanged.
+            ctxCacheEpoch++
 
             // Rebuild UI from DB so the previous marker's divider re-emerges
             // (or all dividers vanish if there are no remaining markers).
@@ -6679,6 +6702,10 @@ class ChatViewModel(
                         }
                         withContext(Dispatchers.Main) {
                             loadedFullFromDb = true
+                            // [T-android-gc-storm-fix20] The full history just
+                            // replaced the tail window; sizes can coincide, so
+                            // the epoch must force a re-measure.
+                            ctxCacheEpoch++
                             _messages.value = chatUi
                             // Re-apply compact graying with the full row set.
                             _cachedLatestMarker?.let { marker ->
@@ -9171,8 +9198,6 @@ class ChatViewModel(
         sendMessage(text, skipContextCheck = false, headless = false)
     }
 
-    private val _pendingSendText = MutableStateFlow<String?>(null)
-
     /**
      * [T-android-fast-session-open-2026-10] The send gate shared by EVERY
      * entry into the send funnel. A fast-opened big session is still
@@ -9183,8 +9208,12 @@ class ChatViewModel(
      */
     private fun parkIfFullHistoryPending(text: String, headless: Boolean, resume: (String) -> Unit): Boolean {
         if (!_fullHistoryPending.value) return false
-        _pendingSendText.value = text
-        _pendingSendHeadlessFastOpen.value = headless
+        // [T-android-fast-open-fix20] Queue, not a single slot: a second send
+        // while the first is parked used to OVERWRITE the slot, and the two
+        // waiters racing on the same "pending=false" signal left one reading
+        // null — the first message was silently lost. Each entry carries its
+        // own headless flag; the waiter drains the queue in order.
+        _pendingSendQueue.addLast(ParkedSend(text, headless, resume))
         if (!headless) {
             appendSystemInfo(
                 text = "正在载入完整会话历史，这条消息已排队，载入完成即自动发送。",
@@ -9193,15 +9222,36 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             _fullHistoryPending.filter { !it }.first()
-            val parked = _pendingSendText.value
-            _pendingSendText.value = null
-            _pendingSendHeadlessFastOpen.value = false
-            if (parked != null) resume(parked)
+            drainParkedSends()
         }
         return true
     }
 
-    private val _pendingSendHeadlessFastOpen = MutableStateFlow(false)
+    /**
+     * [T-android-fast-open-fix20] Drain every parked send in FIFO order. A
+     * single waiter is enough: it owns the queue from the first "pending
+     * cleared" signal until the queue is empty, so a second parked send while
+     * a drain is in flight is picked up by the loop, not lost.
+     */
+    private suspend fun drainParkedSends() {
+        while (_fullHistoryPending.value.not()) {
+            val entry = _pendingSendQueue.removeFirstOrNull() ?: break
+            entry.resume(entry.text)
+            // A resumed send may restart the backfill (session re-entry),
+            // flipping pending back to true; the while-condition re-checks
+            // and this drain parks itself on the next signal implicitly —
+            // the new park() launches its own waiter anyway.
+        }
+    }
+
+    private data class ParkedSend(
+        val text: String,
+        val headless: Boolean,
+        val resume: (String) -> Unit,
+    )
+
+    private val _pendingSendQueue: java.util.Deque<ParkedSend> =
+        java.util.concurrent.ConcurrentLinkedDeque()
 
     /**
      * [T-android-submit-outcome] What happened to a prompt handed to the send
@@ -10604,6 +10654,9 @@ class ChatViewModel(
         }
 
         if (offloadedCount > 0) {
+            // [T-android-gc-storm-fix20] Stubbed parts shrink the effective
+            // view; the last entry is protected so the signature cannot see it.
+            ctxCacheEpoch++
             val afterPct = (currentTokens.toLong() * 100 / contextWindow.coerceAtLeast(1)).toInt()
             AppLogger.info(TAG, "━━━ Context Offload Complete ━━━")
             AppLogger.info(TAG, "  Parts offloaded: $offloadedCount")
