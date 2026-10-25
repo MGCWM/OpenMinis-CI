@@ -190,8 +190,44 @@ object OpenAIModelsApi {
                 // suffixes; the rest of the codebase (models.dev, capability fragments,
                 // ModelEntryDetailScreen toggles) uses the bare form. Normalize at the parse
                 // boundary so persisted overrides round-trip correctly through the toggles.
-                val inputModalities = arch?.optJSONArray("input_modalities")?.toStringList().normalizeModalities()
-                val outputModalities = arch?.optJSONArray("output_modalities")?.toStringList().normalizeModalities()
+                val inputModalities: List<String>? = arch?.optJSONArray("input_modalities")?.toStringList().normalizeModalities()
+                val outputModalities: List<String>? = arch?.optJSONArray("output_modalities")?.toStringList().normalizeModalities()
+                // [T-android-hub-capabilities-vision] sub2api-family hubs
+                // (workbuddy2api-hub and kin) publish a `capabilities` object
+                // on each model entry with `vision: true` for image-capable
+                // models — a field this parser never read, so a vision model
+                // entered the catalog with null modalities and was then
+                // stamped text-only by models.dev enrichment (glm-5.3, whose
+                // non-flash id is text-only across all 31 catalogued
+                // providers while the model itself accepts images). Read it,
+                // plus the top-level `modalities` array some family members
+                // emit ("text_input"/"image_input"), and UNION the results:
+                // any source saying "image" wins over none.
+                val hubInput: List<String>? = run {
+                    val capsObj = obj.optJSONObject("capabilities")
+                    val capsVision: Boolean = capsObj?.let { c ->
+                        when (val v = c.opt("vision")) {
+                            is Boolean -> v
+                            is String -> v.equals("true", ignoreCase = true) || v == "1"
+                            else -> false
+                        }
+                    } ?: false
+                    val topMods = obj.optJSONArray("modalities")?.toStringList()
+                        ?.filter { it.lowercase().endsWith("_input") }
+                        ?.map { it.lowercase().removeSuffix("_input") }
+                        ?.distinct()
+                    val fromCaps = if (capsVision) listOf("text", "image") else emptyList()
+                    val fromTop = topMods?.filter { it != "text" } ?: emptyList()
+                    (fromCaps + fromTop).distinct().takeIf { it.isNotEmpty() }
+                }
+                val hubOutput = obj.optJSONArray("modalities")?.toStringList()
+                    ?.filter { it.lowercase().endsWith("_output") }
+                    ?.map { it.lowercase().removeSuffix("_output") }
+                    ?.distinct()
+                    ?.takeIf { it.isNotEmpty() }
+                val mergedInput: List<String> = (inputModalities ?: emptyList()) + (hubInput ?: emptyList())
+                val finalInput: List<String>? = mergedInput.distinct().takeIf { it.isNotEmpty() }
+                val finalOutput: List<String>? = (outputModalities ?: hubOutput ?: emptyList()).distinct().takeIf { it.isNotEmpty() }
 
                 // T119: known reasoning families (GPT-5.x, o-series, Codex
                 // Mini) get supportsReasoning pre-set to true so the
@@ -219,8 +255,8 @@ object OpenAIModelsApi {
                         id = id,
                         displayName = displayName,
                         provider = if (isCustomBase) "Custom" else "OpenAI",
-                        inputModalities = inputModalities,
-                        outputModalities = outputModalities,
+                        inputModalities = finalInput,
+                        outputModalities = finalOutput,
                         supportsReasoning = if (knownReasoning) true else null,
                     )
                 )

@@ -402,14 +402,38 @@ object ModelsDevApi {
 
     // MARK: - Apply models.dev data
 
+    /**
+     * [T-android-hub-capabilities-vision] Merge a models.dev modalities list
+     * with what the gateway itself declared. Precedence for conflicts is the
+     * union: `["text"]` (catalog) ∪ `["text","image"]` (gateway) →
+     * `["text","image"]`. null on either side means "no opinion" and returns
+     * the other side untouched, preserving the old null-pass-through
+     * semantics — the provider-default fallback in LLMModel still keys off
+     * a null final answer.
+     */
+    private fun unionModalities(dev: List<String>?, model: List<String>?): List<String>? {
+        if (dev == null) return model
+        if (model.isNullOrEmpty()) return dev
+        return (dev + model).distinct()
+    }
+
     private fun applyDevData(model: LLMModel, devModel: ModelDevEntry): LLMModel {
         return model.copy(
             contextWindow = devModel.contextWindow ?: model.contextWindow,
             maxOutputTokens = devModel.maxOutputTokens ?: model.maxOutputTokens,
             supportsReasoning = devModel.reasoning ?: model.supportsReasoning,
             interleavedReasoningField = devModel.interleavedField ?: model.interleavedReasoningField,
-            inputModalities = devModel.inputModalities ?: model.inputModalities,
-            outputModalities = devModel.outputModalities ?: model.outputModalities,
+            // [T-android-hub-capabilities-vision] UNION, not replace. The
+            // gateway's own /v1/models declared this model accepts images
+            // (capabilities.vision — parsed into inputModalities at the
+            // fetch boundary), but the models.dev entry for the SAME id can
+            // say input=['text'] (glm-5.3 non-flash: text-only across every
+            // catalogued provider). The old `devModel.… ?: model.…` let the
+            // catalog's narrower list erase the gateway's affirmative
+            // declaration. Union only when the model side is non-null and
+            // non-empty (null = "no opinion" keeps the old pass-through).
+            inputModalities = unionModalities(devModel.inputModalities, model.inputModalities),
+            outputModalities = unionModalities(devModel.outputModalities, model.outputModalities),
             reasoningEffortValues = devModel.reasoningEffortValues ?: model.reasoningEffortValues,
             // [OpenMinis#163] Only carry the AFFIRMATIVE answer forward, so
             // enriching against an entry the catalog is silent about cannot
