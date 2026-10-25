@@ -83,16 +83,15 @@ class DocumentEditorFieldTest {
         val users = mapOf(
             "ui/settings/MemoryManagementScreen.kt" to 1,   // Settings > Memory > a file
             "ui/settings/SkillsManagementScreen.kt" to 1,   // a skill's SKILL.md / other files
-            "ui/settings/SoulSettingsScreen.kt" to 1,       // persona body
+            // tall2 keeps its own SoulSettingsScreen (persona library +
+            // cap-free body); the upstream DocumentEditorField adoption of
+            // the soul page is not part of this fork.
             "ui/chat/MemoryDetailScreens.kt" to 2,          // the in-chat memory sheet: file and written-memory editors
         )
         for ((path, count) in users) {
             val src = ProductionSources.read(path)
             assertEquals(path, count, Regex("""DocumentEditorField\(""").findAll(src).count())
         }
-        // The persona body lives in a page that scrolls and pads for the keyboard itself.
-        val soul = ProductionSources.read("ui/settings/SoulSettingsScreen.kt")
-        assertTrue(soul.substringAfter("DocumentEditorField(").substringBefore("\n                )").contains("ownScroll = false,"))
         assertTrue(ProductionSources.read("ui/settings/SettingsComponents.kt").contains(".imePadding()"))
         // The full-screen editors no longer hand the document to a field with no keyboard handling.
         assertFalse(ProductionSources.read("ui/chat/MemoryDetailScreens.kt").contains("BasicTextField("))
