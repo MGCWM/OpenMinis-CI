@@ -6,8 +6,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
  * Confirms/installs bash on demand with the design-review guards
@@ -32,6 +30,10 @@ object OnDemandBash {
     private const val UNAVAILABLE_TTL_MS = 10L * 60 * 1000
     private const val INSTALL_BUDGET_MS = 60_000L
     private const val APT_PROBE_URL = "https://ports.ubuntu.com/ubuntu-ports/"
+    /** [FIX-261025-05] FreshProcessShell.CANCELLED_EXIT: the user pressed Stop. */
+    private const val STOPPED_EXIT = 130
+    const val STOPPED_REASON = "stopped by the user"
+    private val APK_PROBE_URL get() = APT_PROBE_URL
 
     private sealed class Availability {
         object Unknown : Availability()
@@ -63,10 +65,14 @@ object OnDemandBash {
             is Availability.Unknown -> {}
         }
 
-        if (executor.run("command -v bash >/dev/null 2>&1", 15_000) == 0) {
+        val probe = executor.run("command -v bash >/dev/null 2>&1", 15_000)
+        if (probe == 0) {
             availability = Availability.Available
             return Outcome.Available
         }
+        // [FIX-261025-05] A user Stop (exit 130) says nothing about bash:
+        // leave every flag as it was so the next command can try again.
+        if (probe == STOPPED_EXIT) return Outcome.Unavailable(STOPPED_REASON)
 
         if (attemptedInstallThisLaunch) {
             markUnavailable()
@@ -85,6 +91,14 @@ object OnDemandBash {
 
         Log.i(TAG, "installing bash (budget ${INSTALL_BUDGET_MS / 1000}s)…")
         val rc = executor.run("DEBIAN_FRONTEND=noninteractive apt-get install -y bash", INSTALL_BUDGET_MS)
+        if (rc == STOPPED_EXIT) {
+            // [FIX-261025-05] Stopped mid-install by the user: not a failed
+            // install, so no strike and no back-off; a later command may
+            // install again.
+            attemptedInstallThisLaunch = false
+            Log.i(TAG, "bash install stopped by the user")
+            return Outcome.Unavailable(STOPPED_REASON)
+        }
         val verified = rc == 0 && executor.run("command -v bash >/dev/null 2>&1", 15_000) == 0
         if (verified) {
             clearFailure(context)
@@ -130,11 +144,12 @@ object OnDemandBash {
 
     private suspend fun networkReachable(): Boolean = withContext(Dispatchers.IO) {
         try {
-            val c = (URL(APT_PROBE_URL).openConnection() as HttpURLConnection).apply {
-                requestMethod = "HEAD"; connectTimeout = 5000; readTimeout = 5000
-            }
-            val code = c.responseCode
-            c.disconnect()
+            // [FEAT-261021-16] Probe the way the shell's package install will go: its
+            // route in Settings > Network (unrouted: the same HttpURLConnection HEAD).
+            val code = com.openminis.app.network.NetworkUrlRequest.open(
+                com.openminis.app.network.NetworkScope.SHELL.tag, APT_PROBE_URL, "HEAD",
+                connectTimeoutMs = 5000, readTimeoutMs = 5000,
+            ).use { it.code }
             code in 200..499
         } catch (_: Exception) {
             false
