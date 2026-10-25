@@ -9235,7 +9235,7 @@ class ChatViewModel(
      */
     private suspend fun drainParkedSends() {
         while (_fullHistoryPending.value.not()) {
-            val entry = _pendingSendQueue.removeFirstOrNull() ?: break
+            val entry = _pendingSendQueue.pollFirst() ?: break
             entry.resume(entry.text)
             // A resumed send may restart the backfill (session re-entry),
             // flipping pending back to true; the while-condition re-checks
@@ -9250,7 +9250,7 @@ class ChatViewModel(
         val resume: (String) -> Unit,
     )
 
-    private val _pendingSendQueue: java.util.Deque<ParkedSend> =
+    private val _pendingSendQueue: java.util.concurrent.ConcurrentLinkedDeque<ParkedSend> =
         java.util.concurrent.ConcurrentLinkedDeque()
 
     /**
