@@ -439,7 +439,7 @@ class BrowserUseManager(
     // scripts, alive across navigations/reloads/same-origin iframes. The
     // built-in trio (net ring / query helpers / viewport guard) is registered
     // unconditionally at init; these are the dynamic user additions.
-    private val initScripts = java.util.concurrent.ConcurrentLinkedDeque<Pair<String, androidx.webkit.WebViewCompat.DocumentStartJavaScript>>()
+    private val initScripts = java.util.concurrent.ConcurrentLinkedDeque<Pair<String, androidx.webkit.ScriptHandler>>()
 
     private var currentProfile: UserAgentProfile
         get() = _profile.value
@@ -2870,7 +2870,7 @@ class BrowserUseManager(
      * fails — the direct path is still attempted rather than dropped.
      */
     private fun spillLargeInlineScript(script: String): String? = runCatching {
-        val dir = java.io.File(appContext.cacheDir, "execjs-spill").apply { mkdirs() }
+        val dir = java.io.File(webView.context.cacheDir, "execjs-spill").apply { mkdirs() }
         val f = java.io.File(dir, "inline-${System.currentTimeMillis()}.js")
         f.writeText(script, Charsets.UTF_8)
         val back = f.readText(Charsets.UTF_8)
@@ -2903,13 +2903,16 @@ class BrowserUseManager(
         if (body.isNullOrBlank()) return BrowserActionResult.error("add_init_script requires 'script' or 'script_file'")
         // replace-by-id
         initScripts.firstOrNull { it.first == id }?.let { old ->
-            runCatching { androidx.webkit.WebViewCompat.removeDocumentStartJavaScript(webView, old.second) }
+            runCatching { old.second.remove() }
             initScripts.remove(old)
         }
         val wrapped = "(function(){try{${body}\n}catch(e){window.__minis_init_err_${id.replace('-','_')}=String(e)}})();"
+        if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            return BrowserActionResult.error("add_init_script: document-start API unsupported on this WebView provider")
+        }
         val handle = runCatching {
             androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, wrapped, setOf("*"))
-        }.getOrNull() ?: return BrowserActionResult.error("add_init_script: document-start API unavailable on this WebView provider")
+        }.getOrNull() ?: return BrowserActionResult.error("add_init_script: registration failed")
         initScripts.add(id to handle)
         return BrowserActionResult(
             text = "Init script '$id' registered — runs at document start on every new document " +
@@ -2922,7 +2925,7 @@ class BrowserUseManager(
             ?: return BrowserActionResult.error("remove_init_script requires 'id'")
         val entry = initScripts.firstOrNull { it.first == id }
             ?: return BrowserActionResult.error("No init script '$id' on this tab")
-        runCatching { androidx.webkit.WebViewCompat.removeDocumentStartJavaScript(webView, entry.second) }
+        runCatching { entry.second.remove() }
         initScripts.remove(entry)
         return BrowserActionResult(text = "Init script '$id' removed.")
     }
