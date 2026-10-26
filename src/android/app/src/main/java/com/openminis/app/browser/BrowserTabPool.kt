@@ -1350,6 +1350,13 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         // per active agent, so a hardcoded MAX_TABS here would cap an agent's
         // quota at the chat's limit and defeat the quota entirely.
         owner: String? = null,
+        // [T-android-newtab-profile-inherit-2026-10] The agent switched THIS
+        // conversation's tab to desktop, opens a new tab, and the new one
+        // silently comes up MOBILE (pool default = MOBILE_CHROME, the "UA
+        // changed" 1.14-era observation was exactly this). When the caller can
+        // name the profile the conversation is already using, the new tab
+        // starts there instead of the global default.
+        profileHint: UserAgentProfile? = null,
     ): Tab? {
         if (tabs.size >= effectiveMaxTabs(owner)) return null
 
@@ -1367,6 +1374,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         }
 
         syncGlobalDefaultsFromStore()
+        val startProfile = profileHint ?: userAgentProfile
         val id = nextTabId++
         val webView = WebView(context)
         // [T-android-minis-url-session-scope] Hand the manager a LIVE reader of
@@ -1375,7 +1383,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         // of the global, last-writer-wins bind-mount map.
         val manager = BrowserUseManager(
             webView,
-            userAgentProfile,
+            startProfile,
             sessionIdProvider = { sessionId },
             appContext = context.applicationContext,
         )
@@ -1441,7 +1449,14 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         if (currentTabs.size >= ceiling) {
             return@withContext BrowserActionResult.error("Maximum $ceiling tabs reached")
         }
-        val tab = createTab(currentTabs, url, owner)
+        // [T-android-newtab-profile-inherit-2026-10] Inherit the ACTIVE tab's
+        // profile: find the most recently active tab and ask its manager what
+        // profile it is on. Null hint = global default (settings-page semantics
+        // untouched).
+        val activeProfile = currentTabs
+            .sortedByDescending { it.lastActivityDate }
+            .firstOrNull()?.manager?.currentProfileSnapshot()
+        val tab = createTab(currentTabs, url, owner, activeProfile)
         if (tab == null) {
             // [T-android-browser-global-tab-cap] The local ceiling was already
             // checked above, so reaching here with tabs below it means the
@@ -1476,6 +1491,10 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         // restamped here — newTab's own narrative already names the tab id below.
         BrowserActionResult(
             text = "Opened new tab ${tab.id}" + (if (url != null) " at $url" else "") +
+                // [T-android-newtab-profile-inherit-2026-10] Say which UA
+                // profile the tab started on, so a surprise Mobile after a
+                // desktop switch is visible immediately.
+                " [profile=${(activeProfile ?: userAgentProfile).value}]" +
                 ". Use tab_id: ${tab.id} to target this tab.",
             tabId = tab.id,
         )

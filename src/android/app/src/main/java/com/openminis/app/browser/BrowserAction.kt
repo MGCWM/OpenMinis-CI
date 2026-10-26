@@ -32,6 +32,14 @@ enum class BrowserAction(val value: String) {
     UPLOAD_FILE("upload_file"),
     GET_CONSOLE_LOGS("get_console_logs"),
     GET_NETWORK_LOG("get_network_log"),
+    // [T-android-init-scripts-2026-10] Persistent per-document injection:
+    // register/unregister/list document-start scripts (the same
+    // WebViewCompat.addDocumentStartJavaScript channel the built-in helpers
+    // use). Survives reloads and same-origin iframes — the LAB_EXAM-class
+    // "page refresh kills my hooks" problem dies here.
+    ADD_INIT_SCRIPT("add_init_script"),
+    REMOVE_INIT_SCRIPT("remove_init_script"),
+    LIST_INIT_SCRIPTS("list_init_scripts"),
     // [T-android-browser-observability-v2] Navigation control, dropdowns,
     // condition waits, and captured fetch/XHR response bodies.
     GO_BACK("go_back"),

@@ -81,6 +81,24 @@ class BrowserUseManager(
          * from anything a page script can resolve with.
          */
         private const val EXECUTE_JS_DID_NOT_PARSE = "\u0000minis:execute_js-did-not-parse"
+        // [T-android-execjs-autolarge-2026-10] inline-script spill threshold
+        private const val INLINE_SPILL_BYTES = 4096
+        // [T-android-host-blocklist-2026-10] Suffix-match list. Keep it to
+        // pure ad/analytics domains; anything a real page needs to function
+        // does NOT belong here.
+        private val HOST_BLOCKLIST_SUFFIX = setOf(
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "google-analytics.com", "googletagmanager.com", "googletagservices.com",
+            "adservice.google.com", "pagead2.googlesyndication.com",
+            "facebook.net", "connect.facebook.net",
+            "scorecardresearch.com", "quantserve.com", "adnxs.com",
+            "criteo.com", "criteo.net", "taboola.com", "outbrain.com",
+            "hotjar.com", "fullstory.com", "amplitude.com", "mixpanel.com",
+            "branch.io", "appsflyer.com", "adjust.com",
+        )
+
+        fun isBlockedHost(host: String): Boolean =
+            HOST_BLOCKLIST_SUFFIX.any { host == it || host.endsWith(".$it") }
 
         /**
          * Cap full_page screenshot stretched viewport at 32768 px. Above this,
@@ -417,6 +435,12 @@ class BrowserUseManager(
     // selected tab's mode, which set_user_agent can make differ from the default.
     private val _profile = MutableStateFlow(profile)
     val profileFlow: StateFlow<UserAgentProfile> = _profile.asStateFlow()
+    // [T-android-init-scripts-2026-10] Agent-registered document-start
+    // scripts, alive across navigations/reloads/same-origin iframes. The
+    // built-in trio (net ring / query helpers / viewport guard) is registered
+    // unconditionally at init; these are the dynamic user additions.
+    private val initScripts = java.util.concurrent.ConcurrentLinkedDeque<Pair<String, androidx.webkit.WebViewCompat.DocumentStartJavaScript>>()
+
     private var currentProfile: UserAgentProfile
         get() = _profile.value
         set(value) { _profile.value = value }
@@ -804,6 +828,21 @@ class BrowserUseManager(
                 view: WebView, request: WebResourceRequest
             ): android.webkit.WebResourceResponse? {
                 val url = request.url ?: return null
+                // [T-android-host-blocklist-2026-10] Ad/tracker hosts die at
+                // the network layer, before the request leaves the device —
+                // faster page loads, less data, less fingerprinting surface.
+                // Blocked requests get an empty 204-ish response so page JS
+                // sees a completed (not failed) load and error handlers don't
+                // spiral. The list is deliberately tiny: only high-noise
+                // trackers that NEVER break page function when absent.
+                if (!request.isForMainFrame) {
+                    val h = url.host?.lowercase()
+                    if (h != null && isBlockedHost(h)) {
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0))).apply {
+                            setStatusCodeAndReasonPhrase(204, "No Content")
+                        }
+                    }
+                }
                 if (url.scheme != "minis") {
                     // [T-android-browser-observability] Record the request trail
                     // (never bodies); data:/blob: are noise.
@@ -1113,6 +1152,23 @@ class BrowserUseManager(
                 // payloads are the worst case — the whole argument stream dies
                 // and the tool layer reports "unknown action"). script_file
                 // reads the body from disk instead.
+                // [T-android-execjs-autolarge-2026-10] Hardening for payloads
+                // that DID arrive: when an INLINE script is large (>4KB), the
+                // WebView bridge wrap (async IIFE + __minis__.resolve) can
+                // still choke on the evaluateJavascript hop. Auto-spill the
+                // body to a temp file and execute through the same read-back
+                // path script_file uses — the model never has to know. The
+                // transport-level truncation itself (argument stream dies →
+                // "unknown action") is upstream of the app and stays mitigated
+                // by the script_file discipline.
+                if (input.scriptFile.isNullOrBlank() && input.script != null &&
+                    input.script!!.length > INLINE_SPILL_BYTES
+                ) {
+                    val spilled = spillLargeInlineScript(input.script!!)
+                    if (spilled != null) {
+                        return executeJS(spilled, input.timeoutMs)
+                    }
+                }
                 val body = if (!input.scriptFile.isNullOrBlank()) {
                     val (file, err) = resolveScriptFile(input.scriptFile!!)
                     if (file == null) return BrowserActionResult.error("script_file: $err")
@@ -1157,6 +1213,9 @@ class BrowserUseManager(
                 )
             }
             BrowserAction.GET_NETWORK_LOG -> return getNetworkLogAction(input)
+            BrowserAction.ADD_INIT_SCRIPT -> return addInitScriptAction(input)
+            BrowserAction.REMOVE_INIT_SCRIPT -> return removeInitScriptAction(input)
+            BrowserAction.LIST_INIT_SCRIPTS -> return listInitScriptsAction()
             BrowserAction.GO_BACK -> {
                 withContext(Dispatchers.Main) { goBack() }
                 return BrowserActionResult(text = "Navigated back (if a previous entry existed)")
@@ -2804,6 +2863,78 @@ class BrowserUseManager(
         return file to null
     }
 
+    /**
+     * [T-android-execjs-autolarge-2026-10] Write a large inline script body to
+     * a temp file under the sandbox tmp dir and read it back through the same
+     * channel script_file uses. Returns the (unchanged) body when the spill
+     * fails — the direct path is still attempted rather than dropped.
+     */
+    private fun spillLargeInlineScript(script: String): String? = runCatching {
+        val dir = java.io.File(appContext.cacheDir, "execjs-spill").apply { mkdirs() }
+        val f = java.io.File(dir, "inline-${System.currentTimeMillis()}.js")
+        f.writeText(script, Charsets.UTF_8)
+        val back = f.readText(Charsets.UTF_8)
+        if (back == script) back else null
+    }.getOrNull()
+
+    /**
+     * [T-android-init-scripts-2026-10] Register a document-start script on
+     * this tab's WebView. Same channel the built-in helpers use
+     * (WebViewCompat.addDocumentStartJavaScript, origin rules "*"), so it
+     * runs before ANY page JS on every new document — reloads and full-page
+     * refreshes included. That is the property execute_js can never offer and
+     * the reason the LAB_EXAM-class "refresh killed my hook" pattern needs
+     * this action. Body comes from `script` or `script_file` (same resolution
+     * as execute_js); `id` is a caller-chosen stable name for later removal.
+     * Re-registering an existing id replaces it (remove + add).
+     */
+    private fun addInitScriptAction(input: BrowserActionInput): BrowserActionResult {
+        val id = input.initScriptId?.trim().takeUnless { it.isNullOrBlank() }
+            ?: return BrowserActionResult.error("add_init_script requires 'id' (stable name for remove/list)")
+        val body = if (!input.scriptFile.isNullOrBlank()) {
+            val (file, err) = resolveScriptFile(input.scriptFile!!)
+            if (file == null) return BrowserActionResult.error("script_file: $err")
+            try { file.readText(Charsets.UTF_8) } catch (t: Throwable) {
+                return BrowserActionResult.error("script_file: read failed — ${t.message}")
+            }
+        } else {
+            input.script
+        }
+        if (body.isNullOrBlank()) return BrowserActionResult.error("add_init_script requires 'script' or 'script_file'")
+        // replace-by-id
+        initScripts.firstOrNull { it.first == id }?.let { old ->
+            runCatching { androidx.webkit.WebViewCompat.removeDocumentStartJavaScript(webView, old.second) }
+            initScripts.remove(old)
+        }
+        val wrapped = "(function(){try{${body}\n}catch(e){window.__minis_init_err_${id.replace('-','_')}=String(e)}})();"
+        val handle = runCatching {
+            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, wrapped, setOf("*"))
+        }.getOrNull() ?: return BrowserActionResult.error("add_init_script: document-start API unavailable on this WebView provider")
+        initScripts.add(id to handle)
+        return BrowserActionResult(
+            text = "Init script '$id' registered — runs at document start on every new document " +
+                "(reloads, navigations, same-origin iframes). Survives page refresh. ${body.length} bytes.",
+        )
+    }
+
+    private fun removeInitScriptAction(input: BrowserActionInput): BrowserActionResult {
+        val id = input.initScriptId?.trim().takeUnless { it.isNullOrBlank() }
+            ?: return BrowserActionResult.error("remove_init_script requires 'id'")
+        val entry = initScripts.firstOrNull { it.first == id }
+            ?: return BrowserActionResult.error("No init script '$id' on this tab")
+        runCatching { androidx.webkit.WebViewCompat.removeDocumentStartJavaScript(webView, entry.second) }
+        initScripts.remove(entry)
+        return BrowserActionResult(text = "Init script '$id' removed.")
+    }
+
+    private fun listInitScriptsAction(): BrowserActionResult {
+        val names = initScripts.map { it.first }
+        return BrowserActionResult(
+            text = if (names.isEmpty()) "No agent init scripts on this tab (built-in net/query/viewport helpers always active)."
+            else "Init scripts on this tab: " + names.joinToString(", "),
+        )
+    }
+
     private suspend fun executeJS(script: String?, timeoutSec: Int?): BrowserActionResult {
         if (script.isNullOrEmpty()) return BrowserActionResult.error("execute_js requires 'script'")
         // [T-android-browser-execjs-2026-10] 'timeout' (seconds) makes the
@@ -3104,6 +3235,7 @@ class BrowserUseManager(
         // a worker. `applyViewport(...)` measures/layouts the detached
         // WebView; settings / reload likewise. Hop to main so we don't
         // crash with "A WebView method was called on thread 'worker-N'".
+        var reloadSettled = false
         withContext(Dispatchers.Main) {
             if (ua != null) {
                 webView.settings.userAgentString = ua
@@ -3112,7 +3244,15 @@ class BrowserUseManager(
             applyViewport(vw, vh)
             val oldUrl = _currentURL.value
             if (oldUrl.isNotEmpty()) {
-                webView.reload()
+                // [T-android-ua-instant-2026-10] reload() is async: the old
+                // document stays the page's live JS context until it finishes,
+                // so navigator.userAgent read right after the switch still
+                // showed the PREVIOUS UA ("didn't take effect" false alarm —
+                // httpbin proved the network side was already correct). Reuse
+                // reloadAndWait() so the action returns only when the new UA
+                // is actually the page's live context. Must run on Main.
+                reloadAndWait()
+                reloadSettled = true
             }
         }
         val vp = viewportOverride() ?: newProfile.viewportSize
@@ -3123,12 +3263,22 @@ class BrowserUseManager(
         val reloaded = _currentURL.value.isNotEmpty()
         return BrowserActionResult(
             text = "Switched this tab to ${newProfile.value} (${vp.first}x${vp.second})" +
-                (if (reloaded) " — page reloaded, new viewport in effect" else " — applies on the next navigation") +
+                (if (reloadSettled) " — page reloaded and settled, new UA + viewport in effect (requiresNavigation=false)"
+                 else if (reloaded) " — page reload issued (still loading; requiresNavigation=false)"
+                 else " — applies on the next navigation (requiresNavigation=true)") +
                 ". Other tabs and the default in Browser Settings are unchanged; a tab opened or rebuilt later uses the default.",
         )
     }
 
     // -- User Navigation --
+
+    /**
+     * [T-android-newtab-profile-inherit-2026-10] Read-only peek at this tab's
+     * current UA profile, so BrowserTabPool.newTab can inherit the profile the
+     * conversation's active tab is actually on (instead of silently resetting
+     * a desktop conversation to Mobile on every new tab).
+     */
+    fun currentProfileSnapshot(): UserAgentProfile = currentProfile
 
     fun goBack() { if (webView.canGoBack()) webView.goBack() }
     fun goForward() { if (webView.canGoForward()) webView.goForward() }

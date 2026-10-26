@@ -18,6 +18,15 @@ object BrowserUseJS {
     val EARLY_NET_INSTRUMENTATION_JS: String = """
         (function(){
           if (window.__minis_net__) return;
+          // [T-android-antifingerprint-2026-10] Automation surface reduction:
+          // navigator.webdriver is the #1 bot-detection signal; WebView never
+          // sets it, but document-start clearing costs nothing and guarantees
+          // it stays false for pages that check it before our helpers land.
+          try {
+            Object.defineProperty(Navigator.prototype, 'webdriver', {
+              get: function() { return false; }, configurable: true
+            });
+          } catch (e) { /* prototype locked — WebView default is false anyway */ }
           var ring = []; window.__minis_net__ = ring;
           var state = {pending: 0, last: Date.now()}; window.__minis_net_state = state;
           var seq = 0;

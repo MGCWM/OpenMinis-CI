@@ -97,6 +97,12 @@ data class BrowserActionInput(
     /** [T-android-hold-tab-2026-10] hold_tab: minutes to keep this tab exempt from idle/memory eviction. */
     val holdMinutes: Int? = null,
     /**
+     * [T-android-init-scripts-2026-10] add_init_script / remove_init_script:
+     * caller-chosen stable id for the document-start script. Re-registering
+     * an existing id replaces it.
+     */
+    val initScriptId: String? = null,
+    /**
      * [T-android-keepalive-probe-2026-10] keep_alive: a secondary URL whose
      * response tells whether the login session is still valid (a page can
      * answer 200 while logged out).
@@ -251,6 +257,7 @@ data class BrowserActionInput(
                     probeExpect = obj.optString("probe_expect").ifEmpty { null },
                     scriptFile = obj.optString("script_file").ifEmpty { null },
                     holdMinutes = if (obj.has("hold_minutes")) obj.optInt("hold_minutes") else null,
+                    initScriptId = obj.optString("init_script_id").ifEmpty { obj.optString("id") },
                 )
             } catch (_: Exception) {
                 null
