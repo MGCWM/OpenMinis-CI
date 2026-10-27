@@ -6651,6 +6651,8 @@ class ChatViewModel(
             // [fullHistoryPending].
             val totalRows = chatRepository.dao.messageCountForSession(sessionId)
             val fastOpen = totalRows > FAST_OPEN_THRESHOLD && !loadedFullFromDb
+            com.openminis.app.diagnostics.PerfLongCtx.step(
+                sessionId, "diag.fastOpen", "totalRows=$totalRows fastOpen=$fastOpen threshold=$FAST_OPEN_THRESHOLD tail=$FAST_OPEN_TAIL")
             val tailRows = if (fastOpen) {
                 chatRepository.dao.loadMessagesPage(
                     sessionId,
@@ -6660,6 +6662,8 @@ class ChatViewModel(
             } else {
                 null
             }
+            com.openminis.app.diagnostics.PerfLongCtx.step(
+                sessionId, "diag.tailRows", "size=${tailRows?.size ?: -1} (full?${tailRows == null})")
             val loaded = withContext(Dispatchers.IO) {
                 val tIoBeforeLoad = System.currentTimeMillis()
                 val rows = tailRows ?: chatRepository.loadMessages(sessionId)
@@ -6675,6 +6679,14 @@ class ChatViewModel(
                     sessionId,
                     "toChatMessages.end",
                     "count=${chatUi.size}",
+                )
+                // [fix23b-diag] Fold ratio is the whole story of the missing
+                // "load older" button: rows >> bubbles when toolResult-only
+                // user rows are dropped and consecutive assistant rows merge.
+                com.openminis.app.diagnostics.PerfLongCtx.step(
+                    sessionId,
+                    "diag.tailFold",
+                    "rows=${rows.size} bubbles=${chatUi.size} ratio=${if (chatUi.isEmpty()) 0 else rows.size * 100 / chatUi.size}%",
                 )
                 // Pre-build the LLM history list off-Main too — toLLMMessage
                 // re-parses partsJson for every row, which is the second
@@ -6930,6 +6942,14 @@ class ChatViewModel(
                         }
                         withContext(Dispatchers.Main) {
                             loadedFullFromDb = true
+                            // [fix23b-diag] Backfill completion is where the
+                            // truth lands: full-row count vs bubble count vs
+                            // the tail window that was on screen before.
+                            com.openminis.app.diagnostics.PerfLongCtx.step(
+                                sessionId,
+                                "diag.backfillDone",
+                                "fullRows=${fullRows.size} fullBubbles=${chatUi.size} tailBubblesWas=${_messages.value.size}",
+                            )
                             // [T-android-gc-storm-fix20] The full history just
                             // replaced the tail window; sizes can coincide, so
                             // the epoch must force a re-measure.
