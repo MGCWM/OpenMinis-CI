@@ -2910,7 +2910,12 @@ class BrowserUseManager(
             runCatching { old.second.remove() }
             initScripts.remove(old)
         }
-        val wrapped = "(function(){try{${body}\n}catch(e){window.__minis_init_err_${id.replace('-','_')}=String(e)}})();"
+        // [T-android-init-script-kill-guard-2026-10] guard reads the DEAD table set
+        // by a kill-setter script registered at remove time. Setter runs after this
+        // script within a doc (registration order), so the kill lands from the NEXT
+        // document on — exactly what remove must guarantee.
+        val guard = "if(window.__MINIS_DEAD__&&window.__MINIS_DEAD__.indexOf('" + id.replace('-','_') + "')>=0)return;"
+        val wrapped = "(function(){try{" + guard + body + "\n}catch(e){window.__minis_init_err_" + id.replace('-','_') + "=String(e)}})();"
         if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
             return BrowserActionResult.error("add_init_script: document-start API unsupported on this WebView provider")
         }
@@ -2940,18 +2945,21 @@ class BrowserUseManager(
         var disarmed = false
         if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
             runCatching {
+                // [T-android-init-script-kill-guard-2026-10] kill-setter: marks the id
+                // dead in every future document; the guard baked into the original
+                // wrapped script checks it BEFORE running its body.
+                val setter = "window.__MINIS_DEAD__=(window.__MINIS_DEAD__||[]).concat(['" + id.replace('-','_') + "']);"
                 val noopHandle = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
                     webView,
-                    "/* removed */",
+                    setter,
                     setOf("*"),
                 )
                 disarmed = true
-                // keep no reference: the noop body replaces nothing observable
                 _noopHandles.add(noopHandle)
             }
         }
         return BrowserActionResult(
-            text = "Init script '$id' removed." + (if (disarmed) "" else " (provider remove may be a no-op; script disarmed via empty replacement)")
+            text = "Init script '$id' removed." + (if (disarmed) " (kill-guard armed: stops injecting from the next document; same-tab provider removal is a no-op)" else "")
         )
     }
 
