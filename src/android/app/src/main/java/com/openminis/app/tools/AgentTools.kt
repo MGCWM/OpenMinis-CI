@@ -230,9 +230,12 @@ object AgentTools {
             // rather than resizing a WKWebView), the cap and the truncation
             // reporting are identical.
             "full_page" to AgentToolParam("boolean", "For screenshot: capture the entire scrollable page by temporarily stretching the browser viewport to document.documentElement.scrollHeight. Default false captures the visible viewport only. Capped at 32768px tall; when capped, the result text includes 'Truncated: true' and the original height, so you can scroll and capture the remainder separately."),
+            // [T-android-init-scripts-2026-10] add_init_script / remove_init_script need a
+            // stable id the model can name and later remove by. list_init_scripts takes none.
+            "id" to AgentToolParam("string", "For add_init_script / remove_init_script: stable identifier for the document-start injection (e.g. 'fake-cam'). add registers (same id replaces), remove unregisters, list needs no id."),
         ),
         required = listOf("tool_title", "action"),
-        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "files", "log_level", "filter", "gesture", "to_x", "to_y", "key", "scale", "index", "method", "body", "headers", "fields", "submit", "full", "offset", "limit", "probe_url", "probe_expect", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
+        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "files", "log_level", "filter", "gesture", "to_x", "to_y", "key", "scale", "index", "method", "body", "headers", "fields", "submit", "full", "offset", "limit", "probe_url", "probe_expect", "timeout", "viewport_width", "viewport_height", "reset", "full_page", "id"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5059-5067
