@@ -576,16 +576,16 @@ class ChatViewModel(
         private const val NEWLINE_FLUSH_MAX_LEN = 5_000
         // [T-android-larky-longsession-followup] see uiMessages / hasOlderMessages.
         /** Tail window size used by [uiMessages] when a session exceeds it. */
-        const val INITIAL_VISIBLE_MESSAGE_CAP: Int = 200
+        const val INITIAL_VISIBLE_MESSAGE_CAP: Int = 800
         /** Each "load older" tap grows the cap by this many messages. */
-        const val VISIBLE_MESSAGE_CAP_STEP: Int = 100
+        const val VISIBLE_MESSAGE_CAP_STEP: Int = 200
         /**
          * Sessions with this many or fewer messages bypass the windowing
          * machinery entirely — the derived `uiMessages` returns the same
          * list reference as `messages`, so Compose sees identity-equal
          * snapshots and the existing flat/stream pipeline is untouched.
          */
-        const val LONG_SESSION_THRESHOLD: Int = 300
+        const val LONG_SESSION_THRESHOLD: Int = 500
 
         /**
          * [T-android-fast-session-open-2026-10] Sessions above this many rows
@@ -595,7 +595,7 @@ class ChatViewModel(
         const val FAST_OPEN_THRESHOLD: Int = 400
 
         /** How many newest rows the fast path loads for the first paint. */
-        const val FAST_OPEN_TAIL: Int = 220
+        const val FAST_OPEN_TAIL: Int = 800
         // T258: tool block statuses with no committed tool_result. retryLast()
         // drops blocks in any of these states because they would orphan the
         // assistant tool_use entry on retry (the API rejects unmatched
