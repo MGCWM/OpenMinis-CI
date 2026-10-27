@@ -441,6 +441,10 @@ class BrowserUseManager(
     // unconditionally at init; these are the dynamic user additions.
     private val initScripts = java.util.concurrent.ConcurrentLinkedDeque<Pair<String, androidx.webkit.ScriptHandler>>()
 
+    // [T-android-init-script-remove-noop-2026-10] Handles of noop replacement scripts
+    // used to disarm removes on providers where ScriptHandler.remove() is a no-op.
+    private val _noopHandles = java.util.concurrent.ConcurrentLinkedDeque<androidx.webkit.ScriptHandler>()
+
     private var currentProfile: UserAgentProfile
         get() = _profile.value
         set(value) { _profile.value = value }
@@ -2925,9 +2929,30 @@ class BrowserUseManager(
             ?: return BrowserActionResult.error("remove_init_script requires 'id'")
         val entry = initScripts.firstOrNull { it.first == id }
             ?: return BrowserActionResult.error("No init script '$id' on this tab")
-        runCatching { entry.second.remove() }
         initScripts.remove(entry)
-        return BrowserActionResult(text = "Init script '$id' removed.")
+        // [T-android-init-script-remove-noop-2026-10] On some WebView providers
+        // (Chromium 138 observed) ScriptHandler.remove() silently no-ops, leaving the
+        // script injected into every new document. Replace-with-noop is the reliable
+        // disarm: re-register the same id with an empty body so the stale script is
+        // overwritten, then drop our bookkeeping entry. The leftover no-op script in
+        // the provider is harmless (empty IIFE).
+        runCatching { entry.second.remove() }
+        var disarmed = false
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            runCatching {
+                val noopHandle = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                    webView,
+                    "/* removed */",
+                    setOf("*"),
+                )
+                disarmed = true
+                // keep no reference: the noop body replaces nothing observable
+                _noopHandles.add(noopHandle)
+            }
+        }
+        return BrowserActionResult(
+            text = "Init script '$id' removed." + (if (disarmed) "" else " (provider remove may be a no-op; script disarmed via empty replacement)")
+        )
     }
 
     private fun listInitScriptsAction(): BrowserActionResult {
