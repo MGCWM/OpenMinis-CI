@@ -2914,7 +2914,7 @@ class BrowserUseManager(
         // by a kill-setter script registered at remove time. Setter runs after this
         // script within a doc (registration order), so the kill lands from the NEXT
         // document on — exactly what remove must guarantee.
-        val guard = "if(window.__MINIS_DEAD__&&window.__MINIS_DEAD__.indexOf('" + id.replace('-','_') + "')>=0)return;"
+        val guard = "try{var __d=(JSON.parse(localStorage.getItem('__MINIS_DEAD__')||'[]'));if(__d.indexOf('" + id.replace('-','_') + "')>=0)return;}catch(e){}"
         val wrapped = "(function(){try{" + guard + body + "\n}catch(e){window.__minis_init_err_" + id.replace('-','_') + "=String(e)}})();"
         if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
             return BrowserActionResult.error("add_init_script: document-start API unsupported on this WebView provider")
@@ -2948,7 +2948,7 @@ class BrowserUseManager(
                 // [T-android-init-script-kill-guard-2026-10] kill-setter: marks the id
                 // dead in every future document; the guard baked into the original
                 // wrapped script checks it BEFORE running its body.
-                val setter = "window.__MINIS_DEAD__=(window.__MINIS_DEAD__||[]).concat(['" + id.replace('-','_') + "']);"
+                val setter = "try{var __d=JSON.parse(localStorage.getItem('__MINIS_DEAD__')||'[]');if(__d.indexOf('" + id.replace('-','_') + "')<0){__d.push('" + id.replace('-','_') + "');localStorage.setItem('__MINIS_DEAD__',JSON.stringify(__d));}}catch(e){}"
                 val noopHandle = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
                     webView,
                     setter,
@@ -2959,7 +2959,7 @@ class BrowserUseManager(
             }
         }
         return BrowserActionResult(
-            text = "Init script '$id' removed." + (if (disarmed) " (kill-guard armed: stops injecting from the next document; same-tab provider removal is a no-op)" else "")
+            text = "Init script '$id' removed." + (if (disarmed) " (kill-guard armed: persisted to localStorage; the script's guard sees it from the next document)" else "")
         )
     }
 
