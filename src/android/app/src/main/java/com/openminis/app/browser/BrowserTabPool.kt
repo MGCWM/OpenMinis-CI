@@ -1914,6 +1914,13 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         tab.inUseGraceJob = null
         tabLocks.remove(tab.id)
         appliedConfigs.remove(tab.id)
+        // [fix24-W3] The pool never called manager.dispose() — it tears the
+        // WebView down directly — so the document-start handles (init scripts
+        // + kill-guard noops) and legacy spill files were never released on
+        // the pool's reclaim path. Free them here, on the same Main-thread
+        // path, before the WebView itself dies. Both helpers are idempotent
+        // and swallow provider quirks (remove() no-ops on WebView 138).
+        runCatching { tab.manager.releaseDocumentStartArtifacts() }
         try {
             val webView = tab.manager.webView
             webView.stopLoading()

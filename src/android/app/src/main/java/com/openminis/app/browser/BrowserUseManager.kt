@@ -198,11 +198,43 @@ class BrowserUseManager(
     var isDisposed: Boolean = false
         private set
 
+    /**
+     * [fix24-W3] Release every document-start artifact this tab owns: the
+     * agent-registered init scripts, the kill-guard noop handles, and any
+     * legacy execjs-spill files. Called from BOTH release paths — dispose()
+     * (sheet close) and BrowserTabPool.releaseTabResources() (pool reclaim,
+     * which tears the WebView down without ever calling dispose()).
+     *
+     * On providers where ScriptHandler.remove() is a no-op (WebView 138) the
+     * remove calls are harmless no-ops; on providers where it works they free
+     * the provider-side script slots. Either way our bookkeeping is cleared
+     * so the handles GC with the tab. Idempotent: the deques are empty after
+     * the first call, and the spill delete is best-effort.
+     */
+    fun releaseDocumentStartArtifacts() {
+        for (entry in initScripts) {
+            runCatching { entry.second.remove() }
+        }
+        initScripts.clear()
+        for (h in _noopHandles) {
+            runCatching { h.remove() }
+        }
+        _noopHandles.clear()
+        // [fix24-W2] Legacy spill files (pre-UUID naming, never deleted)
+        // die with the tab. The directory is tiny and cache-scoped; delete
+        // best-effort, never crash a release over an IO error.
+        runCatching {
+            java.io.File(webView.context.cacheDir, "execjs-spill").listFiles()?.forEach { it.delete() }
+        }
+    }
+
     /** Permanent release, always on Main; a hidden sheet must not call this. */
     fun dispose() {
         check(Looper.myLooper() == Looper.getMainLooper())
         if (isDisposed) return
         isDisposed = true
+        // [fix24-W3] Drop every document-start handle this tab registered.
+        releaseDocumentStartArtifacts()
         navigationDeferred?.cancel()
         navigationDeferred = null
         asyncJsDeferred?.cancel()
@@ -1168,9 +1200,18 @@ class BrowserUseManager(
                 if (input.scriptFile.isNullOrBlank() && input.script != null &&
                     input.script!!.length > INLINE_SPILL_BYTES
                 ) {
-                    val spilled = spillLargeInlineScript(input.script!!)
-                    if (spilled != null) {
-                        return executeJS(spilled, input.timeoutMs)
+                    // [fix24-W2] Spill owns a file now: read the body back
+                    // (verified identical by the spill writer), execute it,
+                    // and ALWAYS delete the file — success, JS exception and
+                    // timeout alike. cacheDir no longer accumulates spills.
+                    val spillFile = spillLargeInlineScript(input.script!!)
+                    if (spillFile != null) {
+                        try {
+                            val body = spillFile.readText(Charsets.UTF_8)
+                            return executeJS(body, input.timeoutMs)
+                        } finally {
+                            spillFile.delete()
+                        }
                     }
                 }
                 val body = if (!input.scriptFile.isNullOrBlank()) {
@@ -2873,12 +2914,25 @@ class BrowserUseManager(
      * channel script_file uses. Returns the (unchanged) body when the spill
      * fails — the direct path is still attempted rather than dropped.
      */
-    private fun spillLargeInlineScript(script: String): String? = runCatching {
+    /**
+     * [fix24-W2] Auto-spill for oversized inline scripts. Returns the FILE so
+     * the caller can (a) read the body back through the same script_file path
+     * and (b) delete the file in a finally block. Two defects closed here:
+     * 1. The old name was `inline-${System.currentTimeMillis()}.js` — two
+     *    calls in the same millisecond (batch execute_js) wrote the SAME
+     *    file and each read the other's script back. The name now carries a
+     *    UUID, so collisions are impossible.
+     * 2. Nothing ever deleted the spill files; cacheDir accumulated them
+     *    forever. Callers own deletion now (see EXECUTE_JS spill branch).
+     * The read-back verify stays: a truncated write is caught before the
+     * WebView ever sees the body.
+     */
+    private fun spillLargeInlineScript(script: String): java.io.File? = runCatching {
         val dir = java.io.File(webView.context.cacheDir, "execjs-spill").apply { mkdirs() }
-        val f = java.io.File(dir, "inline-${System.currentTimeMillis()}.js")
+        val f = java.io.File(dir, "inline-${java.util.UUID.randomUUID()}.js")
         f.writeText(script, Charsets.UTF_8)
         val back = f.readText(Charsets.UTF_8)
-        if (back == script) back else null
+        if (back == script) f else run { f.delete(); null }
     }.getOrNull()
 
     /**
