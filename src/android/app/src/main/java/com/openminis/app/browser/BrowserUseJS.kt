@@ -9,6 +9,64 @@ import org.json.JSONObject
 object BrowserUseJS {
 
     /**
+     * [T-android-google-auth-stealth-2026-10] document-start facade for the
+     * Google sign-in / OAuth surface. Google permanently rejects WebView-based
+     * sign-in via multi-signal detection (UA, X-Requested-With, Sec-CH-UA, JS
+     * surface, TLS ClientHello). The TLS ClientHello and X-Requested-With are
+     * not addressable from JS, but the JS-surface half IS, and combined with a
+     * desktop-Chrome UA it clears enough signals that accounts.google.com
+     * serves the normal login page instead of 403 disallowed_useragent.
+     *
+     * Gated by host so it only ever runs on Google auth domains — it must NOT
+     * alter the JS surface for the page the user is actually trying to sign
+     * into (InstaBox, GitHub, whatever). Kept idempotent like the other
+     * document-start scripts.
+     */
+    val GOOGLE_AUTH_STEALTH_JS: String = """
+        (function(){
+          if (window.__minis_gauth__) return;
+          var ok = false;
+          try {
+            var h = (location.hostname || '').toLowerCase();
+            ok = h === 'accounts.google.com' || h === 'signin.google.com' ||
+                 h === 'myaccount.google.com' || h === 'oauth2.googleapis.com' ||
+                 h === 'accounts.youtube.com' ||
+                 /(^|[.])google\.com$/.test(h) || /(^|[.])gstatic\.com$/.test(h);
+          } catch (e) { ok = false; }
+          if (!ok) return;
+          window.__minis_gauth__ = true;
+          try {
+            // WebView advertises itself through navigator.userAgentData brands.
+            // Override with a plain Chrome brand list; wrapped in try since
+            // userAgentData may be undefined on older providers.
+            if (navigator.userAgentData && navigator.userAgentData.brands) {
+              try {
+                Object.defineProperty(navigator.userAgentData, 'brands', {
+                  get: function() { return [
+                    { brand: 'Google Chrome', version: '134' },
+                    { brand: 'Chromium', version: '134' },
+                    { brand: 'Not_A Brand', version: '24' }
+                  ]; },
+                  configurable: true
+                });
+              } catch (_) {}
+              try {
+                Object.defineProperty(navigator.userAgentData, 'mobile', {
+                  get: function() { return false; }, configurable: true
+                });
+              } catch (_) {}
+            }
+          } catch (_) {}
+          try {
+            // channels/isContact/maxTouchPoints: WebView reports touch input
+            // and an unknown channel. A desktop Chrome reports no touch and
+            // 'stable'. Both are cheap to lie about on this surface.
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: function() { return 0; }, configurable: true });
+          } catch (_) {}
+        })();
+    """
+
+    /**
      * [T-android-browser-observability-v2] Installed at document start (or on
      * page start as a fallback): wraps fetch + XMLHttpRequest to record
      * RESPONSE bodies into `window.__minis_net__` (bounded ring), and forwards

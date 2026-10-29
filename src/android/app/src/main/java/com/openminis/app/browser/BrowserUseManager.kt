@@ -482,6 +482,13 @@ class BrowserUseManager(
         set(value) { _profile.value = value }
 
     /**
+     * [T-android-google-auth-stealth-2026-10] The custom UA string the pool
+     * last applied (if any). Kept so the Google-auth UA swap can restore the
+     * exact UA the tab was on before it entered a Google auth domain.
+     */
+    private var appliedCustomUA: String? = null
+
+    /**
      * [ISS-033] Session / global custom viewport, or null for the profile's
      * own size. Set by [BrowserTabPool] so set_user_agent keeps the usual
      * precedence (session > global custom > profile default).
@@ -768,14 +775,23 @@ class BrowserUseManager(
             ): Boolean {
                 val urlStr = request.url?.toString()
                 // T234: Google permanently disallows WebView for sign-in /
-                // OAuth. Hand any auth-domain navigation to Chrome Custom
-                // Tab so the user can complete login in their real Chrome
-                // session instead of hitting 403 disallowed_useragent.
+                // OAuth — but that is a UA + JS-surface detection, not a
+                // network-level block. With a desktop-Chrome UA and the
+                // document-start stealth script (BrowserUseJS.GOOGLE_AUTH_STEALTH_JS)
+                // the login page loads and the OAuth redirect_uri returns to
+                // THIS WebView, so the site's session cookie lands in our jar.
+                // The old behaviour (hand the auth URL to a Chrome Custom Tab)
+                // completed login in Chrome's cookie jar and left the WebView
+                // spinning forever after the user came back.
                 if (GoogleAuthRouter.shouldRouteExternally(urlStr)) {
-                    if (urlStr != null) {
-                        GoogleAuthRouter.openInCustomTab(view.context, urlStr)
+                    // Swap to desktop-Chrome UA BEFORE the navigation so the
+                    // request to accounts.google.com already carries it.
+                    val desktopUA = UserAgentProfile.DESKTOP_CHROME.userAgentString
+                    if (desktopUA != null) {
+                        webView.settings.userAgentString = desktopUA
                     }
-                    return true
+                    Log.i(TAG, "Google auth navigated inside WebView (desktop UA + stealth JS)")
+                    return false
                 }
                 // T134: route intent://, market://, tel:, mailto:, … out
                 // of the WebView so they reach the matching app instead of
@@ -797,6 +813,30 @@ class BrowserUseManager(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                // [T-android-google-auth-stealth-2026-10] Google's sign-in
+                // surface refuses a MOBILE-Chrome UA from an Android WebView.
+                // On Google auth domains only, swap to the desktop-Chrome UA
+                // (which the stealth script's JS surface matches); every other
+                // host keeps the user's chosen profile. Restored on the next
+                // non-Google page start.
+                val onGoogle = GoogleAuthRouter.shouldRouteExternally(url)
+                val desktopUA = UserAgentProfile.DESKTOP_CHROME.userAgentString
+                if (onGoogle && desktopUA != null) {
+                    if (webView.settings.userAgentString != desktopUA) {
+                        webView.settings.userAgentString = desktopUA
+                    }
+                } else {
+                    // Restore the tab's profile UA if a previous Google page
+                    // had swapped it to desktop.
+                    val profileUA = if (currentProfile == UserAgentProfile.CUSTOM && !appliedCustomUA.isNullOrEmpty()) {
+                        appliedCustomUA
+                    } else {
+                        currentProfile.userAgentString
+                    }
+                    if (profileUA != null && webView.settings.userAgentString != profileUA) {
+                        webView.settings.userAgentString = profileUA
+                    }
+                }
                 // [T-android-browser-observability-v2] Best-effort fallback for
                 // WebViews without DOCUMENT_START_SCRIPT; idempotent in-page.
                 earlyScriptFallback?.let { runCatching { view.evaluateJavascript(it, null) } }
@@ -2615,6 +2655,10 @@ class BrowserUseManager(
         // [T-android-viewport-guard-2026-10] Third script: rewrites malformed
         // viewport metas (initial-scale=0) before the page can be clamped.
         val vpGuard = BrowserUseJS.VIEWPORT_GUARD_JS
+        // [T-android-google-auth-stealth-2026-10] Fourth: on Google auth
+        // domains only, lie about the JS surface so accounts.google.com does
+        // not recognise this as a WebView and serve disallowed_useragent.
+        val gAuth = BrowserUseJS.GOOGLE_AUTH_STEALTH_JS
         try {
             if (androidx.webkit.WebViewFeature.isFeatureSupported(
                     androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT,
@@ -2623,15 +2667,16 @@ class BrowserUseManager(
                 androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, net, setOf("*"))
                 androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, helpers, setOf("*"))
                 androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, vpGuard, setOf("*"))
-                Log.d(TAG, "net + query + viewport instrumentation registered at document start")
+                androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView, gAuth, setOf("*"))
+                Log.d(TAG, "net + query + viewport + google-auth instrumentation registered at document start")
                 return
             }
         } catch (t: Throwable) {
             Log.w(TAG, "document-start script unsupported: ${t.message}")
         }
-        // Fallback: inject on page start (all three scripts are idempotent).
-        earlyScriptFallback = net + "\n" + helpers + "\n" + vpGuard
-        Log.d(TAG, "net + query + viewport instrumentation registered via page-start fallback")
+        // Fallback: inject on page start (all four scripts are idempotent).
+        earlyScriptFallback = net + "\n" + helpers + "\n" + vpGuard + "\n" + gAuth
+        Log.d(TAG, "net + query + viewport + google-auth instrumentation registered via page-start fallback")
     }
 
     private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = SCREENSHOT_QUALITY): File {
@@ -3233,6 +3278,7 @@ class BrowserUseManager(
      */
     fun applyUserAgentQuiet(profile: UserAgentProfile, customUA: String?) {
         currentProfile = profile
+        appliedCustomUA = customUA
         val ua = if (profile == UserAgentProfile.CUSTOM && !customUA.isNullOrEmpty()) customUA
             else profile.userAgentString
         if (ua != null) {
@@ -3243,6 +3289,7 @@ class BrowserUseManager(
     /** Set user agent from UI settings (public, non-result). */
     fun setUserAgent(profile: UserAgentProfile, customUA: String? = null) {
         currentProfile = profile
+        appliedCustomUA = customUA
         val ua = if (profile == UserAgentProfile.CUSTOM && !customUA.isNullOrEmpty()) customUA
             else profile.userAgentString
         if (ua != null) {
