@@ -43,6 +43,11 @@ object WebViewNetworkProxy {
 
     /** Called on every runtime publish (NetworkHub registers it). */
     fun apply(snapshot: NetworkRuntime.Snapshot) {
+        // [fix26] A Google-auth borrow owns the override for the duration of
+        // an OAuth flow; a runtime publish must not yank it mid-login (that
+        // would re-break accounts.google.com while the user is on the consent
+        // screen). endGoogleAuthOverride() releases it and re-applies.
+        if (googleAuthBorrow) return
         val ep = snapshot.endpoint(NetworkScope.BROWSER.tag)
         val hp = ep?.httpPort
         val want = hp?.let { "127.0.0.1:$it" }
@@ -76,6 +81,71 @@ object WebViewNetworkProxy {
             // keeps whatever it had (direct, if nothing was ever set).
             AppLogger.error(TAG, "[Net][Browser] proxy override failed: ${t.javaClass.simpleName}: ${t.message}")
         }
+    }
+
+    /**
+     * [fix26] Google sign-in rescue. accounts.google.com (and friends) die
+     * with a TLS reset when the WebView dials direct, on networks where the
+     * path to Google is blocked at the TLS layer. The Go-side entry is alive
+     * and reaches Google (the shell proves it daily), so while a Google auth
+     * flow is in progress we temporarily point the WebView at the entry's
+     * HTTP front.
+     *
+     * Scope choice matters: the 407 username IS the routing tag, and a tag
+     * routed Direct makes the entry itself dial direct — the same dead path.
+     * So we take the browser scope's endpoint when it has one, and otherwise
+     * borrow the first scope whose route actually leaves through the entry
+     * (shell is the one the sandbox proves reaches Google). If every scope is
+     * direct there is nothing to borrow; we log and stay direct.
+     *
+     * endGoogleAuthOverride() restores whatever apply(snapshot) last wanted.
+     */
+    @Volatile
+    private var googleAuthBorrow: Boolean = false
+
+    fun beginGoogleAuthOverride() {
+        if (googleAuthBorrow) return
+        val snap = NetworkRuntime.snapshot
+        val ep = snap.endpoint(NetworkScope.BROWSER.tag)
+            ?: NetworkScope.entries.firstNotNullOfOrNull { scope -> snap.endpoint(scope.tag) }
+        if (ep == null || ep.httpPort == null) {
+            AppLogger.info(TAG, "[Net][Browser] Google auth borrow: no entry-routed scope; staying direct")
+            return
+        }
+        googleAuthBorrow = true
+        val want = "127.0.0.1:${ep.httpPort}"
+        if (want == applied) {
+            // Same endpoint is already installed — but the 407 username is
+            // the routing tag, so it must match the scope we just borrowed
+            // from even when the address did not change.
+            credentials = ep.tag to ep.password
+            return
+        }
+        credentials = ep.tag to ep.password
+        if (!isSupported()) {
+            AppLogger.warning(TAG, "[Net][Browser] PROXY_OVERRIDE unsupported; Google auth stays direct")
+            return
+        }
+        try {
+            val config = ProxyConfig.Builder()
+                .addProxyRule("http://$want")
+                .addBypassRule("localhost")
+                .addBypassRule("127.0.0.1")
+                .addBypassRule("[::1]")
+                .build()
+            ProxyController.getInstance().setProxyOverride(config, direct) {}
+            applied = want
+            AppLogger.info(TAG, "[Net][Browser] Google auth borrow: WebView -> local entry $want (tag=${ep.tag})")
+        } catch (t: Throwable) {
+            AppLogger.error(TAG, "[Net][Browser] Google auth borrow failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    fun endGoogleAuthOverride() {
+        if (!googleAuthBorrow) return
+        googleAuthBorrow = false
+        AppLogger.info(TAG, "[Net][Browser] Google auth borrow ended; restoring route")
+        apply(NetworkRuntime.snapshot)
     }
 
     /**

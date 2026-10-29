@@ -35,10 +35,25 @@ object GoogleAuthRouter {
         "myaccount.google.com",
         "oauth2.googleapis.com",
         "accounts.youtube.com",
+        // [fix26] The OAuth dance hops across these too (consent screens,
+        // JS/CSS origins, recaptcha). All Google-owned, all refused by the
+        // same TLS reset on a direct connection.
+        "www.google.com",
+        "ssl.google.com",
+        "www.gstatic.com",
+        "www.recaptcha.net",
+        "clients2.google.com",
+        "play.google.com",
     )
 
     /** Returns true if [url] should be opened externally (Custom Tab). */
     fun shouldRouteExternally(url: String?): Boolean {
+        if (url.isNullOrEmpty()) return false
+        return hostIsGoogleAuth(url)
+    }
+
+    /** [fix26] Public host-level test: is this URL on a Google auth domain? */
+    fun hostIsGoogleAuth(url: String?): Boolean {
         if (url.isNullOrEmpty()) return false
         val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return false
         return GOOGLE_AUTH_HOSTS.any { host == it || host.endsWith(".$it") }

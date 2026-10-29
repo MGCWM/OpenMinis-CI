@@ -774,25 +774,29 @@ class BrowserUseManager(
                 request: WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
-                // T234: Google permanently disallows WebView for sign-in /
-                // OAuth — but that is a UA + JS-surface detection, not a
-                // network-level block. With a desktop-Chrome UA and the
-                // document-start stealth script (BrowserUseJS.GOOGLE_AUTH_STEALTH_JS)
-                // the login page loads and the OAuth redirect_uri returns to
-                // THIS WebView, so the site's session cookie lands in our jar.
-                // The old behaviour (hand the auth URL to a Chrome Custom Tab)
-                // completed login in Chrome's cookie jar and left the WebView
-                // spinning forever after the user came back.
+                // T234/fix26: Google permanently disallows WebView for sign-in
+                // / OAuth — but the block users actually hit here is NETWORK
+                // level: on networks where Google is unreachable, the WebView's
+                // direct dial dies with a TLS reset (handshake failed,
+                // net_error -100) and the OAuth page never paints. The Go-side
+                // entry CAN reach Google (the shell proves it), so while we are
+                // in a Google auth flow we point the WebView at that entry:
+                // beginGoogleAuthOverride() is a no-op when the browser scope
+                // was already proxied. URL stays in this WebView, so the
+                // redirect_uri comes back to THIS jar — no Chrome handoff, no
+                // "logged in but the app still spins" split-jar problem.
                 if (GoogleAuthRouter.shouldRouteExternally(urlStr)) {
-                    // Swap to desktop-Chrome UA BEFORE the navigation so the
-                    // request to accounts.google.com already carries it.
-                    val desktopUA = UserAgentProfile.DESKTOP_CHROME.userAgentString
-                    if (desktopUA != null) {
-                        webView.settings.userAgentString = desktopUA
-                    }
-                    Log.i(TAG, "Google auth navigated inside WebView (desktop UA + stealth JS)")
+                    WebViewNetworkProxy.beginGoogleAuthOverride()
+                    // Google serves a phone layout off a plain mobile-Chrome
+                    // UA; the mobile profile UA already carries no "; wv"
+                    // marker, so nothing else needs swapping here (fix25's
+                    // desktop UA made the page render zoomed-out desktop).
+                    Log.i(TAG, "Google auth: in-WebView + borrowed entry proxy")
                     return false
                 }
+                // Any non-Google navigation means the auth dance is over
+                // (either finished or abandoned): hand the proxy back.
+                WebViewNetworkProxy.endGoogleAuthOverride()
                 // T134: route intent://, market://, tel:, mailto:, … out
                 // of the WebView so they reach the matching app instead of
                 // surfacing as ERR_UNKNOWN_URL_SCHEME.
@@ -813,29 +817,13 @@ class BrowserUseManager(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // [T-android-google-auth-stealth-2026-10] Google's sign-in
-                // surface refuses a MOBILE-Chrome UA from an Android WebView.
-                // On Google auth domains only, swap to the desktop-Chrome UA
-                // (which the stealth script's JS surface matches); every other
-                // host keeps the user's chosen profile. Restored on the next
-                // non-Google page start.
-                val onGoogle = GoogleAuthRouter.shouldRouteExternally(url)
-                val desktopUA = UserAgentProfile.DESKTOP_CHROME.userAgentString
-                if (onGoogle && desktopUA != null) {
-                    if (webView.settings.userAgentString != desktopUA) {
-                        webView.settings.userAgentString = desktopUA
-                    }
-                } else {
-                    // Restore the tab's profile UA if a previous Google page
-                    // had swapped it to desktop.
-                    val profileUA = if (currentProfile == UserAgentProfile.CUSTOM && !appliedCustomUA.isNullOrEmpty()) {
-                        appliedCustomUA
-                    } else {
-                        currentProfile.userAgentString
-                    }
-                    if (profileUA != null && webView.settings.userAgentString != profileUA) {
-                        webView.settings.userAgentString = profileUA
-                    }
+                // [fix26] Page start is the reliable hook for the END of a
+                // Google auth flow: the redirect_uri hop back to the site is a
+                // server-side 302, which shouldOverrideUrlLoading may not see.
+                // Whichever non-Google host we land on, the borrowed entry
+                // proxy goes back to whatever the browser route says.
+                if (!GoogleAuthRouter.hostIsGoogleAuth(url)) {
+                    WebViewNetworkProxy.endGoogleAuthOverride()
                 }
                 // [T-android-browser-observability-v2] Best-effort fallback for
                 // WebViews without DOCUMENT_START_SCRIPT; idempotent in-page.
