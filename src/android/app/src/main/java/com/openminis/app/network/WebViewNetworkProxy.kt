@@ -120,10 +120,22 @@ object WebViewNetworkProxy {
     fun beginGoogleAuthOverride() {
         if (googleAuthBorrow) return
         val snap = NetworkRuntime.snapshot
-        val ep = snap.endpoint(NetworkScope.BROWSER.tag)
-            ?: NetworkScope.entries.firstNotNullOfOrNull { scope -> snap.endpoint(scope.tag) }
+        // [fix28] The endpoint() call does NOT mean "this scope leaves through
+        // an upstream": when Tailscale is enabled even a Direct-routed scope
+        // gets an endpoint (so tailnet destinations can be split off), and
+        // such a scope would make the entry dial the same dead direct path
+        // to Google that the WebView just failed on. So a scope only counts
+        // as borrowable when its RESOLVED route is not plain Direct.
+        // Preference: the browser scope if it qualifies, else the first
+        // non-Direct scope (shell is the one the sandbox proves works).
+        val borrowable = NetworkScope.entries.filter { scope ->
+            snap.endpoint(scope.tag) != null &&
+                snap.route(scope.tag) != NetworkRoute.Direct
+        }
+        val ep = borrowable.firstOrNull { it == NetworkScope.BROWSER }?.let { snap.endpoint(it.tag) }
+            ?: borrowable.firstOrNull()?.let { snap.endpoint(it.tag) }
         if (ep == null || ep.httpPort == null) {
-            AppLogger.info(TAG, "[Net][Browser] Google auth borrow: no entry-routed scope; staying direct")
+            AppLogger.info(TAG, "[Net][Browser] Google auth borrow: no non-Direct routed scope; staying direct")
             return
         }
         val want = "127.0.0.1:${ep.httpPort}"
