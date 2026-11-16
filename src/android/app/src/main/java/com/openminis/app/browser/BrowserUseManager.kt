@@ -234,6 +234,12 @@ class BrowserUseManager(
         check(Looper.myLooper() == Looper.getMainLooper())
         if (isDisposed) return
         isDisposed = true
+        // [fix27] If this tab is mid-Google-OAuth and dies (user closed it,
+        // renderer crash, pool reclaim), the process-wide ProxyController
+        // override this tab borrowed must be handed back — otherwise the
+        // borrow flag stays set forever and every later route change is
+        // swallowed by the apply() guard.
+        WebViewNetworkProxy.endGoogleAuthOverride()
         // [fix24-W3] Drop every document-start handle this tab registered.
         releaseDocumentStartArtifacts()
         navigationDeferred?.cancel()

@@ -47,7 +47,15 @@ object WebViewNetworkProxy {
         // an OAuth flow; a runtime publish must not yank it mid-login (that
         // would re-break accounts.google.com while the user is on the consent
         // screen). endGoogleAuthOverride() releases it and re-applies.
-        if (googleAuthBorrow) return
+        // [fix27] The publish is not LOST though — remember it so
+        // endGoogleAuthOverride applies the LATEST snapshot, not whatever the
+        // runtime happened to hold at the moment the borrow ends (which could
+        // be a route the user already changed away from).
+        if (googleAuthBorrow) {
+            pendingAfterBorrow = snapshot
+            return
+        }
+        pendingAfterBorrow = null
         val ep = snapshot.endpoint(NetworkScope.BROWSER.tag)
         val hp = ep?.httpPort
         val want = hp?.let { "127.0.0.1:$it" }
@@ -103,6 +111,12 @@ object WebViewNetworkProxy {
     @Volatile
     private var googleAuthBorrow: Boolean = false
 
+    /** [fix27] The most recent snapshot a publish delivered while a borrow was
+     * active; endGoogleAuthOverride applies this instead of re-reading the
+     * runtime, so a route change mid-login is not lost. */
+    @Volatile
+    private var pendingAfterBorrow: NetworkRuntime.Snapshot? = null
+
     fun beginGoogleAuthOverride() {
         if (googleAuthBorrow) return
         val snap = NetworkRuntime.snapshot
@@ -112,16 +126,21 @@ object WebViewNetworkProxy {
             AppLogger.info(TAG, "[Net][Browser] Google auth borrow: no entry-routed scope; staying direct")
             return
         }
-        googleAuthBorrow = true
         val want = "127.0.0.1:${ep.httpPort}"
+        // [fix27] Mark borrow only after every early-return / failure path is
+        // behind us. The previous code set googleAuthBorrow=true before the
+        // isSupported() check and the ProxyController call, so a throw or an
+        // unsupported provider left the flag set forever — apply() would
+        // short-circuit on every subsequent runtime publish and the browser
+        // could never be re-routed again.
         if (want == applied) {
             // Same endpoint is already installed — but the 407 username is
             // the routing tag, so it must match the scope we just borrowed
             // from even when the address did not change.
             credentials = ep.tag to ep.password
+            googleAuthBorrow = true
             return
         }
-        credentials = ep.tag to ep.password
         if (!isSupported()) {
             AppLogger.warning(TAG, "[Net][Browser] PROXY_OVERRIDE unsupported; Google auth stays direct")
             return
@@ -135,8 +154,12 @@ object WebViewNetworkProxy {
                 .build()
             ProxyController.getInstance().setProxyOverride(config, direct) {}
             applied = want
+            credentials = ep.tag to ep.password
+            googleAuthBorrow = true
             AppLogger.info(TAG, "[Net][Browser] Google auth borrow: WebView -> local entry $want (tag=${ep.tag})")
         } catch (t: Throwable) {
+            // [fix27] borrow flag stays false; the previous override (if any)
+            // is whatever the route wanted, nothing to roll back here.
             AppLogger.error(TAG, "[Net][Browser] Google auth borrow failed: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
@@ -145,7 +168,10 @@ object WebViewNetworkProxy {
         if (!googleAuthBorrow) return
         googleAuthBorrow = false
         AppLogger.info(TAG, "[Net][Browser] Google auth borrow ended; restoring route")
-        apply(NetworkRuntime.snapshot)
+        // [fix27] Prefer the latest snapshot a publish delivered mid-borrow;
+        // fall back to the live runtime snapshot otherwise.
+        apply(pendingAfterBorrow ?: NetworkRuntime.snapshot)
+        pendingAfterBorrow = null
     }
 
     /**

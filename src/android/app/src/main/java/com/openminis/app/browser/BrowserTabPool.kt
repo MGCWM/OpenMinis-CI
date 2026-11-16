@@ -18,6 +18,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import com.openminis.app.R
+import com.openminis.app.network.WebViewNetworkProxy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -1921,6 +1922,11 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         // path, before the WebView itself dies. Both helpers are idempotent
         // and swallow provider quirks (remove() no-ops on WebView 138).
         runCatching { tab.manager.releaseDocumentStartArtifacts() }
+        // [fix27] Same reason the Google-auth proxy borrow must be handed
+        // back here too: this path destroys the WebView without ever running
+        // dispose(), so a tab reclaimed mid-OAuth would otherwise leak the
+        // process-wide ProxyController override.
+        runCatching { WebViewNetworkProxy.endGoogleAuthOverride() }
         try {
             val webView = tab.manager.webView
             webView.stopLoading()
