@@ -837,6 +837,10 @@ class BrowserUseManager(
                 if (!GoogleAuthRouter.hostIsGoogleAuth(url)) {
                     WebViewNetworkProxy.endGoogleAuthOverride(borrowToken)
                 }
+                // [fix31] Every top-level page gets a fresh 407 budget, so a
+                // page that once struggled cannot permanently disable auth for
+                // the rest of the session.
+                WebViewNetworkProxy.resetAuthAttempts()
                 // [T-android-browser-observability-v2] Best-effort fallback for
                 // WebViews without DOCUMENT_START_SCRIPT; idempotent in-page.
                 earlyScriptFallback?.let { runCatching { view.evaluateJavascript(it, null) } }

@@ -29,6 +29,12 @@ object WebViewNetworkProxy {
     /** realm the entry's HTTP front sends in its challenge (nethub/httpentry.go). */
     private const val REALM = "Minis"
 
+    /** [fix31] How many times one page may be re-challenged before we stop. */
+    private const val MAX_AUTH_ATTEMPTS = 3
+
+    /** [fix31] Rejection counter keyed by "pageHost|realm"; cleared per page. */
+    private val authAttempts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     private val direct = Executor { it.run() }
 
     @Volatile
@@ -126,6 +132,7 @@ object WebViewNetworkProxy {
 
     fun beginGoogleAuthOverride(owner: Int) {
         if (!googleAuthOwners.add(owner)) return  // already held by this owner
+        resetAuthAttempts()                       // [fix31] fresh budget per login
         if (googleAuthBorrow) return              // someone else holds it; we joined the set
         val snap = NetworkRuntime.snapshot
         // [fix28] The endpoint() call does NOT mean "this scope leaves through
@@ -199,6 +206,12 @@ object WebViewNetworkProxy {
      * For WebViewClient.onReceivedHttpAuthRequest: answers the local entry's
      * proxy challenge and returns true; false for any other site's auth
      * request, which the caller handles as before.
+     *
+     * [fix31] Challenges are capped. If the entry keeps rejecting the same
+     * credential the browser would otherwise loop 407 -> proceed -> 407
+     * forever (fix30 review, Q2): nothing in the app layer ever stopped it.
+     * After [MAX_AUTH_ATTEMPTS] rejections for one page we cancel the handler
+     * instead, which surfaces a normal auth-failure page.
      */
     fun answerAuth(handler: HttpAuthHandler, host: String?, realm: String?, pageUrl: String?): Boolean {
         val c = credentials ?: return false
@@ -208,7 +221,24 @@ object WebViewNetworkProxy {
         // comes from a local server, not the entry: never hand it the password.
         val pageHost = pageUrl?.let { runCatching { android.net.Uri.parse(it).host }.getOrNull() }
         if (pageHost == "127.0.0.1" || pageHost == "localhost" || pageHost == "::1") return false
+
+        val key = (pageHost ?: host ?: "?") + "|" + realm
+        val n = authAttempts.getOrPut(key) { 0 } + 1
+        authAttempts[key] = n
+        if (n > MAX_AUTH_ATTEMPTS) {
+            AppLogger.info(
+                TAG,
+                "[Net][Browser] proxy auth rejected ${n - 1}x for $key; cancelling instead of looping",
+            )
+            runCatching { handler.cancel() }
+            return true
+        }
         handler.proceed(c.first, c.second)
         return true
+    }
+
+    /** [fix31] A new top-level page (or a fresh borrow) starts a new budget. */
+    fun resetAuthAttempts() {
+        if (authAttempts.isNotEmpty()) authAttempts.clear()
     }
 }
