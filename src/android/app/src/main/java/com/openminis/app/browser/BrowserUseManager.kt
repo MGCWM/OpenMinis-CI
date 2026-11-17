@@ -239,7 +239,7 @@ class BrowserUseManager(
         // override this tab borrowed must be handed back — otherwise the
         // borrow flag stays set forever and every later route change is
         // swallowed by the apply() guard.
-        WebViewNetworkProxy.endGoogleAuthOverride()
+        WebViewNetworkProxy.endGoogleAuthOverride(borrowToken)
         // [fix24-W3] Drop every document-start handle this tab registered.
         releaseDocumentStartArtifacts()
         navigationDeferred?.cancel()
@@ -479,6 +479,11 @@ class BrowserUseManager(
     // built-in trio (net ring / query helpers / viewport guard) is registered
     // unconditionally at init; these are the dynamic user additions.
     private val initScripts = java.util.concurrent.ConcurrentLinkedDeque<Pair<String, androidx.webkit.ScriptHandler>>()
+
+    // [fix30] Owner token for the Google-auth proxy borrow. Stable for this
+    // manager instance's lifetime, so every begin/end pair from the same tab
+    // is matched correctly and foreign tabs cannot release our borrow.
+    val borrowToken: Int = System.identityHashCode(this)
 
     // [T-android-init-script-remove-noop-2026-10] Handles of noop replacement scripts
     // used to disarm removes on providers where ScriptHandler.remove() is a no-op.
@@ -793,7 +798,7 @@ class BrowserUseManager(
                 // redirect_uri comes back to THIS jar — no Chrome handoff, no
                 // "logged in but the app still spins" split-jar problem.
                 if (GoogleAuthRouter.shouldRouteExternally(urlStr)) {
-                    WebViewNetworkProxy.beginGoogleAuthOverride()
+                    WebViewNetworkProxy.beginGoogleAuthOverride(borrowToken)
                     // Google serves a phone layout off a plain mobile-Chrome
                     // UA; the mobile profile UA already carries no "; wv"
                     // marker, so nothing else needs swapping here (fix25's
@@ -803,7 +808,7 @@ class BrowserUseManager(
                 }
                 // Any non-Google navigation means the auth dance is over
                 // (either finished or abandoned): hand the proxy back.
-                WebViewNetworkProxy.endGoogleAuthOverride()
+                WebViewNetworkProxy.endGoogleAuthOverride(borrowToken)
                 // T134: route intent://, market://, tel:, mailto:, … out
                 // of the WebView so they reach the matching app instead of
                 // surfacing as ERR_UNKNOWN_URL_SCHEME.
@@ -830,7 +835,7 @@ class BrowserUseManager(
                 // Whichever non-Google host we land on, the borrowed entry
                 // proxy goes back to whatever the browser route says.
                 if (!GoogleAuthRouter.hostIsGoogleAuth(url)) {
-                    WebViewNetworkProxy.endGoogleAuthOverride()
+                    WebViewNetworkProxy.endGoogleAuthOverride(borrowToken)
                 }
                 // [T-android-browser-observability-v2] Best-effort fallback for
                 // WebViews without DOCUMENT_START_SCRIPT; idempotent in-page.

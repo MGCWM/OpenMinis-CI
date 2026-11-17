@@ -1926,7 +1926,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
         // back here too: this path destroys the WebView without ever running
         // dispose(), so a tab reclaimed mid-OAuth would otherwise leak the
         // process-wide ProxyController override.
-        runCatching { WebViewNetworkProxy.endGoogleAuthOverride() }
+        runCatching { WebViewNetworkProxy.endGoogleAuthOverride(tab.manager.borrowToken) }
         try {
             val webView = tab.manager.webView
             webView.stopLoading()

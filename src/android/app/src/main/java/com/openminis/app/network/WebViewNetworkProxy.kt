@@ -111,10 +111,12 @@ object WebViewNetworkProxy {
     @Volatile
     private var googleAuthBorrow: Boolean = false
 
-    /** [fix29] How many in-flight Google-auth navigations hold the borrow.
-     * Only the transition to zero releases the override. */
-    @Volatile
-    private var borrowCount: Int = 0
+    /** [fix30] Owner-token based borrow. Each caller (BrowserUseManager) uses
+     * its identityHashCode as the token. Only an owner that actually began
+     * a borrow can end it, and the override is released when the last owner
+     * releases. Replaces fix29's bare counter, which underflowed when a
+     * non-borrower called end and did not count the first borrower at all. */
+    private val googleAuthOwners = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
 
     /** [fix27] The most recent snapshot a publish delivered while a borrow was
      * active; endGoogleAuthOverride applies this instead of re-reading the
@@ -122,15 +124,9 @@ object WebViewNetworkProxy {
     @Volatile
     private var pendingAfterBorrow: NetworkRuntime.Snapshot? = null
 
-    fun beginGoogleAuthOverride() {
-        // [fix29] Reference-count the borrow. Two tabs can be mid-OAuth at
-        // once; without a count the first tab to finish (or to bounce off a
-        // Google page) releases the proxy for BOTH and the survivor's next
-        // Google request dies on the direct path again.
-        if (googleAuthBorrow) {
-            borrowCount++
-            return
-        }
+    fun beginGoogleAuthOverride(owner: Int) {
+        if (!googleAuthOwners.add(owner)) return  // already held by this owner
+        if (googleAuthBorrow) return              // someone else holds it; we joined the set
         val snap = NetworkRuntime.snapshot
         // [fix28] The endpoint() call does NOT mean "this scope leaves through
         // an upstream": when Tailscale is enabled even a Direct-routed scope
@@ -188,14 +184,9 @@ object WebViewNetworkProxy {
         }
     }
 
-    fun endGoogleAuthOverride() {
-        if (!googleAuthBorrow) return
-        // [fix29] Only release when the last borrower is done. Each Google
-        // page navigation in each tab holds one reference; a tab that never
-        // entered Google holds none (its end call must not underflow the
-        // count below zero).
-        if (borrowCount > 0 && --borrowCount > 0) return
-        borrowCount = 0
+    fun endGoogleAuthOverride(owner: Int) {
+        if (!googleAuthOwners.remove(owner)) return  // this owner never held it
+        if (googleAuthOwners.isNotEmpty()) return    // others still borrowing
         googleAuthBorrow = false
         AppLogger.info(TAG, "[Net][Browser] Google auth borrow ended; restoring route")
         // [fix27] Prefer the latest snapshot a publish delivered mid-borrow;
