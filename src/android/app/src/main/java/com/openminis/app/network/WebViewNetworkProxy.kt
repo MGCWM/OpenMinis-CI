@@ -111,6 +111,11 @@ object WebViewNetworkProxy {
     @Volatile
     private var googleAuthBorrow: Boolean = false
 
+    /** [fix29] How many in-flight Google-auth navigations hold the borrow.
+     * Only the transition to zero releases the override. */
+    @Volatile
+    private var borrowCount: Int = 0
+
     /** [fix27] The most recent snapshot a publish delivered while a borrow was
      * active; endGoogleAuthOverride applies this instead of re-reading the
      * runtime, so a route change mid-login is not lost. */
@@ -118,7 +123,14 @@ object WebViewNetworkProxy {
     private var pendingAfterBorrow: NetworkRuntime.Snapshot? = null
 
     fun beginGoogleAuthOverride() {
-        if (googleAuthBorrow) return
+        // [fix29] Reference-count the borrow. Two tabs can be mid-OAuth at
+        // once; without a count the first tab to finish (or to bounce off a
+        // Google page) releases the proxy for BOTH and the survivor's next
+        // Google request dies on the direct path again.
+        if (googleAuthBorrow) {
+            borrowCount++
+            return
+        }
         val snap = NetworkRuntime.snapshot
         // [fix28] The endpoint() call does NOT mean "this scope leaves through
         // an upstream": when Tailscale is enabled even a Direct-routed scope
@@ -178,6 +190,12 @@ object WebViewNetworkProxy {
 
     fun endGoogleAuthOverride() {
         if (!googleAuthBorrow) return
+        // [fix29] Only release when the last borrower is done. Each Google
+        // page navigation in each tab holds one reference; a tab that never
+        // entered Google holds none (its end call must not underflow the
+        // count below zero).
+        if (borrowCount > 0 && --borrowCount > 0) return
+        borrowCount = 0
         googleAuthBorrow = false
         AppLogger.info(TAG, "[Net][Browser] Google auth borrow ended; restoring route")
         // [fix27] Prefer the latest snapshot a publish delivered mid-borrow;
