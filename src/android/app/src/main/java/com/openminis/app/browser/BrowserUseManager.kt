@@ -175,6 +175,10 @@ class BrowserUseManager(
                 displayZoomControls = false
                 setSupportMultipleWindows(true)
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                // [fix33] Learn the device's real engine version before the UA
+                // is composed, so Chrome/<major> in the UA matches the
+                // Sec-CH-UA client hints the same WebView sends.
+                UserAgentProfile.initFromWebView(webView.context)
                 val ua = customUA ?: profile.userAgentString
                 if (ua != null) userAgentString = ua
             }
@@ -507,13 +511,20 @@ class BrowserUseManager(
         return cleaned
     }
 
-    /** Present a real-version mobile Chrome identity for Google sign-in. */
+    /** Present a real-version mobile Chrome identity for Google sign-in.
+     *
+     * [fix33] Only the DESKTOP profile needs this: its UA claims X11 while the
+     * WebView's client hints still say Android. The MOBILE profile is already
+     * self-consistent — its UA is built from the device token and the real
+     * Chrome major ([UserAgentProfile.initFromWebView]) — so it is left
+     * untouched, which also keeps this off the reload path entirely. */
     private fun enterGoogleAuthIdentity() {
+        if (currentProfile != UserAgentProfile.DESKTOP_CHROME) return
         val ua = googleAuthUserAgent() ?: return
         googleAuthUaApplied = true
         if (runCatching { webView.settings.userAgentString }.getOrNull() == ua) return
         runCatching { webView.settings.userAgentString = ua }
-        Log.i(TAG, "[fix32] Google auth UA: real-version mobile Chrome in effect")
+        Log.i(TAG, "[fix33] Google auth UA: desktop profile swapped to real-version mobile Chrome")
     }
 
     /** Restore the tab's configured profile UA after the auth dance. */
@@ -883,11 +894,14 @@ class BrowserUseManager(
                     // back so the site itself renders with the profile the
                     // user chose.
                     leaveGoogleAuthIdentity()
-                } else {
-                    // Direct hop into Google (server-side redirect straight to
-                    // accounts.google.com) never passes shouldOverrideUrlLoading.
-                    enterGoogleAuthIdentity()
                 }
+                // [fix33] NOTE: no UA change on this path any more. fix32 called
+                // enterGoogleAuthIdentity() here — inside onPageStarted, i.e.
+                // *after* the load had started — and Chromium restarts the load
+                // whenever settings.userAgentString changes, which re-entered
+                // onPageStarted and reloaded forever. Profile UAs now carry the
+                // device's real engine version (UserAgentProfile.initFromWebView),
+                // so Google sees a self-consistent identity with no per-host swap.
                 // [fix31] Every top-level page gets a fresh 407 budget, so a
                 // page that once struggled cannot permanently disable auth for
                 // the rest of the session.

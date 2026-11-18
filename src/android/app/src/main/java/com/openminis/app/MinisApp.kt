@@ -262,6 +262,12 @@ class MinisApp : Application(), ImageLoaderFactory {
         // [T-oauth-wait-fgs] Before anything can start an OAuth callback server:
         // gives it a context to keep the process out of the freezer with.
         com.openminis.app.service.OAuthWaitKeepAlive.install(this)
+        // [fix33] Learn the device's real Chromium version once, before any
+        // WebView exists, so every profile UA carries a Chrome/<major> that
+        // matches the Sec-CH-UA client hints the engine will send.
+        runCatching {
+            com.openminis.app.browser.UserAgentProfile.initFromWebView(this)
+        }
         // [T-android-tls-trust-error] Localized text for a rejected certificate;
         // LLMError has no Context of its own.
         com.openminis.app.data.model.CertificateErrorText.resolver = { kind, host ->

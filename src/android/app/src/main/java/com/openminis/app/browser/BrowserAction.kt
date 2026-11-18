@@ -134,10 +134,19 @@ enum class UserAgentProfile(val value: String) {
     DESKTOP_CHROME("desktop_chrome"),
     CUSTOM("custom");
 
+    /** [fix33] Both UAs take their Chrome version from the device's real
+     * WebView (see [initFromWebView]) so the UA never disagrees with the
+     * Sec-CH-UA client hints Chromium sends alongside it. A pinned 134 UA on
+     * a 138 engine is exactly what made Google answer "this browser or app
+     * may not be secure". */
     val userAgentString: String?
         get() = when (this) {
-            MOBILE_CHROME -> "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
-            DESKTOP_CHROME -> "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            MOBILE_CHROME ->
+                "Mozilla/5.0 (Linux; $deviceToken) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Chrome/$chromeMajor.0.0.0 Mobile Safari/537.36"
+            DESKTOP_CHROME ->
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Chrome/$chromeMajor.0.0.0 Safari/537.36"
             CUSTOM -> null
         }
 
@@ -156,6 +165,37 @@ enum class UserAgentProfile(val value: String) {
 
     companion object {
         fun fromString(s: String): UserAgentProfile? = entries.find { it.value == s }
+
+        /** Chrome major derived from the device WebView; replaced by
+         *  [initFromWebView] on first use. */
+        @Volatile
+        private var chromeMajor: String = "134"
+
+        /** "Android 16; PKR110" — the platform token of the device UA. */
+        @Volatile
+        private var deviceToken: String = "Android 14; Pixel 8"
+
+        /**
+         * [fix33] Learn the real engine version once, from the WebView's own
+         * default UA, and rebuild every profile UA from it. Must be cheap and
+         * idempotent: it runs on the first banner creation and again whenever
+         * a WebView is created with a different provider.
+         */
+        fun initFromWebView(context: android.content.Context) {
+            val raw = runCatching {
+                android.webkit.WebSettings.getDefaultUserAgent(context)
+            }.getOrNull() ?: return
+            runCatching { Regex("Chrome/(\\d+)").find(raw)?.groupValues?.get(1) }
+                .getOrNull()?.let { chromeMajor = it }
+            // "Linux; Android 16; PKR110 Build/...; wv)" -> "Android 16; PKR110"
+            val inner = Regex("\\(([^)]*)\\)").find(raw)?.groupValues?.get(1) ?: return
+            val token = inner
+                .removePrefix("Linux; ")
+                .replace(Regex("\\s*Build/[^;)]*"), "")
+                .replace("; wv", "")
+                .trim()
+            if (token.startsWith("Android")) deviceToken = token
+        }
 
         /**
          * [ISS-033] A user_agent argument: case-insensitive, "-" read as "_",
