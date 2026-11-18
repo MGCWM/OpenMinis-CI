@@ -35,16 +35,24 @@ object BrowserUseJS {
           } catch (e) { ok = false; }
           if (!ok) return;
           window.__minis_gauth__ = true;
+          // [fix32] Stay SELF-CONSISTENT instead of inventing a fixed brand
+          // list. Google cross-checks the UA's Chrome version against the
+          // Sec-CH-UA client hints WebView itself sends (real Chromium
+          // version). A hardcoded brand list (the previous 134) disagreed
+          // with the real 138 and got flagged as "browser may not be secure".
+          // Derive every spoofed value from the UA that is actually in force.
+          var ua = '';
+          try { ua = navigator.userAgent || ''; } catch (_) {}
+          var m = /Chrome\/(\d+)/.exec(ua);
+          var major = m ? m[1] : '';
+          var isMobile = /Mobile|Android/.test(ua);
           try {
-            // WebView advertises itself through navigator.userAgentData brands.
-            // Override with a plain Chrome brand list; wrapped in try since
-            // userAgentData may be undefined on older providers.
-            if (navigator.userAgentData && navigator.userAgentData.brands) {
+            if (navigator.userAgentData && navigator.userAgentData.brands && major) {
               try {
                 Object.defineProperty(navigator.userAgentData, 'brands', {
                   get: function() { return [
-                    { brand: 'Google Chrome', version: '134' },
-                    { brand: 'Chromium', version: '134' },
+                    { brand: 'Google Chrome', version: major },
+                    { brand: 'Chromium', version: major },
                     { brand: 'Not_A Brand', version: '24' }
                   ]; },
                   configurable: true
@@ -52,16 +60,30 @@ object BrowserUseJS {
               } catch (_) {}
               try {
                 Object.defineProperty(navigator.userAgentData, 'mobile', {
-                  get: function() { return false; }, configurable: true
+                  get: function() { return isMobile; }, configurable: true
+                });
+              } catch (_) {}
+              try {
+                Object.defineProperty(navigator.userAgentData, 'platform', {
+                  get: function() { return isMobile ? 'Android' : 'Linux'; },
+                  configurable: true
                 });
               } catch (_) {}
             }
           } catch (_) {}
           try {
-            // channels/isContact/maxTouchPoints: WebView reports touch input
-            // and an unknown channel. A desktop Chrome reports no touch and
-            // 'stable'. Both are cheap to lie about on this surface.
-            Object.defineProperty(navigator, 'maxTouchPoints', { get: function() { return 0; }, configurable: true });
+            // Touch capability must match the identity we present: an Android
+            // phone reports touch, a desktop does not. Claiming 0 while the UA
+            // says "Android ... Mobile" is itself a WebView tell.
+            Object.defineProperty(navigator, 'maxTouchPoints', {
+              get: function() { return isMobile ? 5 : 0; }, configurable: true
+            });
+          } catch (_) {}
+          try {
+            Object.defineProperty(navigator, 'platform', {
+              get: function() { return isMobile ? 'Linux armv8l' : 'Linux x86_64'; },
+              configurable: true
+            });
           } catch (_) {}
         })();
     """

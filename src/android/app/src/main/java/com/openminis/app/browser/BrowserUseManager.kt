@@ -485,6 +485,46 @@ class BrowserUseManager(
     // is matched correctly and foreign tabs cannot release our borrow.
     val borrowToken: Int = System.identityHashCode(this)
 
+    // [fix32] Google refuses sign-in when the UA's Chrome version disagrees
+    // with the Sec-CH-UA client hints the WebView sends (they carry the REAL
+    // Chromium version). Profile UAs are pinned to 134 while this device runs
+    // 138, so on Google auth hosts we swap in a clean mobile Chrome UA built
+    // from the WebView's own default UA — same version, no "; wv" marker.
+    private var googleAuthUaApplied = false
+    private var cleanGoogleUa: String? = null
+
+    private fun googleAuthUserAgent(): String? {
+        cleanGoogleUa?.let { return it }
+        val raw = runCatching {
+            android.webkit.WebSettings.getDefaultUserAgent(webView.context)
+        }.getOrNull() ?: return null
+        val cleaned = raw
+            .replace("; wv", "")
+            .replace("Version/4.0 ", "")
+            .replace(Regex(" Build/[^;)]+"), "")
+            .trim()
+        cleanGoogleUa = cleaned
+        return cleaned
+    }
+
+    /** Present a real-version mobile Chrome identity for Google sign-in. */
+    private fun enterGoogleAuthIdentity() {
+        val ua = googleAuthUserAgent() ?: return
+        googleAuthUaApplied = true
+        if (runCatching { webView.settings.userAgentString }.getOrNull() == ua) return
+        runCatching { webView.settings.userAgentString = ua }
+        Log.i(TAG, "[fix32] Google auth UA: real-version mobile Chrome in effect")
+    }
+
+    /** Restore the tab's configured profile UA after the auth dance. */
+    private fun leaveGoogleAuthIdentity() {
+        if (!googleAuthUaApplied) return
+        googleAuthUaApplied = false
+        val ua = if (currentProfile == UserAgentProfile.CUSTOM && !appliedCustomUA.isNullOrEmpty())
+            appliedCustomUA else currentProfile.userAgentString
+        if (ua != null) runCatching { webView.settings.userAgentString = ua }
+    }
+
     // [T-android-init-script-remove-noop-2026-10] Handles of noop replacement scripts
     // used to disarm removes on providers where ScriptHandler.remove() is a no-op.
     private val _noopHandles = java.util.concurrent.ConcurrentLinkedDeque<androidx.webkit.ScriptHandler>()
@@ -799,11 +839,14 @@ class BrowserUseManager(
                 // "logged in but the app still spins" split-jar problem.
                 if (GoogleAuthRouter.shouldRouteExternally(urlStr)) {
                     WebViewNetworkProxy.beginGoogleAuthOverride(borrowToken)
-                    // Google serves a phone layout off a plain mobile-Chrome
-                    // UA; the mobile profile UA already carries no "; wv"
-                    // marker, so nothing else needs swapping here (fix25's
-                    // desktop UA made the page render zoomed-out desktop).
-                    Log.i(TAG, "Google auth: in-WebView + borrowed entry proxy")
+                    // [fix32] The profile UA is pinned to Chrome/134 while
+                    // this device's WebView is 138. Google cross-checks the
+                    // UA version against the Sec-CH-UA hints WebView sends
+                    // (real version) and answers "此浏览器或应用可能不安全"
+                    // on a mismatch. Swap in a clean mobile-Chrome UA built
+                    // from the real default UA: same version, no "; wv".
+                    enterGoogleAuthIdentity()
+                    Log.i(TAG, "Google auth: in-WebView + borrowed entry proxy + real-version UA")
                     return false
                 }
                 // Any non-Google navigation means the auth dance is over
@@ -836,6 +879,14 @@ class BrowserUseManager(
                 // proxy goes back to whatever the browser route says.
                 if (!GoogleAuthRouter.hostIsGoogleAuth(url)) {
                     WebViewNetworkProxy.endGoogleAuthOverride(borrowToken)
+                    // [fix32] Leaving the auth dance: put the tab's profile UA
+                    // back so the site itself renders with the profile the
+                    // user chose.
+                    leaveGoogleAuthIdentity()
+                } else {
+                    // Direct hop into Google (server-side redirect straight to
+                    // accounts.google.com) never passes shouldOverrideUrlLoading.
+                    enterGoogleAuthIdentity()
                 }
                 // [fix31] Every top-level page gets a fresh 407 budget, so a
                 // page that once struggled cannot permanently disable auth for
